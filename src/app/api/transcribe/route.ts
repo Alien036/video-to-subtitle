@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import Groq from "groq-sdk";
 
+export const maxDuration = 60;
+
 export interface WhisperSegment {
   id: number;
   seek?: number;

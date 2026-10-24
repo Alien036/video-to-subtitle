@@ -36,7 +36,7 @@ import {
 
 type ProcessingStep = 0 | 1 | 2 | 3 | 4;
 
-const CHUNK_DURATION_SECONDS = 600; // 10 dakika = 600 saniye
+const CHUNK_DURATION_SECONDS = 300; // 5 dakika = 300 saniye (~1.7 MB / parça, Vercel 4.5 MB sınırının altında)
 
 const LANGUAGES = [
   { code: "tr", label: "Türkçe (TR)" },
@@ -251,10 +251,10 @@ export default function VideoToSubtitlePage() {
       );
 
       setStatusLog(
-        "Ses akışı Mono 16kHz 64kbps MP3 olarak daraltılıyor ve 10 dakikalık parçalara bölünüyor..."
+        "Ses akışı Mono 16kHz MP3 olarak daraltılıyor ve 5 dakikalık (~1.7 MB) parçalara bölünüyor..."
       );
 
-      // Tek bir FFmpeg komutuyla hem tam MP3 hem de 10 dakikalık (600 sn) chunk_XXX.mp3 üret
+      // Tek bir FFmpeg komutuyla hem tam MP3 hem de 5 dakikalık (300 sn, 48kbps) chunk_XXX.mp3 üret
       const exitCode = await ffmpeg.exec([
         "-i",
         `/input/${videoFile.name}`,
@@ -267,14 +267,14 @@ export default function VideoToSubtitlePage() {
         "-b:a",
         "64k",
         "full_audio.mp3",
-        // 2. Çıktı: Groq Whisper 25MB sınırına takılmamak için 10'ar dakikalık (~4.5MB) parçalar
+        // 2. Çıktı: Vercel 4.5MB sınırına takılmamak için 5'er dakikalık (~1.7MB, 48kbps) parçalar
         "-vn",
         "-ac",
         "1",
         "-ar",
         "16000",
         "-b:a",
-        "64k",
+        "48k",
         "-f",
         "segment",
         "-segment_time",
@@ -361,12 +361,26 @@ export default function VideoToSubtitlePage() {
           body: formData,
         });
 
-        const result = await response.json();
+        const responseText = await response.text();
+        let result: {
+          error?: string;
+          text?: string;
+          duration?: number;
+          segments?: Array<{ start: number; end: number; text: string }>;
+        };
+
+        try {
+          result = JSON.parse(responseText);
+        } catch {
+          throw new Error(
+            `Sunucu geçersiz bir yanıt döndürdü (HTTP ${response.status}): ${responseText.slice(0, 200)}`
+          );
+        }
 
         if (!response.ok) {
           throw new Error(
             result.error ||
-              `Parça ${chunkIndex + 1} işlenirken API hatası oluştu (HTTP ${response.status}).`
+              `Parça ${chunkIndex + 1} işlenirken API hatası oluştu (HTTP ${response.status}): ${responseText.slice(0, 200)}`
           );
         }
 
@@ -467,7 +481,7 @@ export default function VideoToSubtitlePage() {
       id: 2,
       title: "5 GB Video Diskten Okunuyor ve Ses Ayıklanıyor",
       description:
-        "WORKERFS ile RAM şişmeden 16kHz Mono MP3 ve 10 dk parçalar üretiliyor",
+        "WORKERFS ile RAM şişmeden 16kHz Mono MP3 ve 5 dk (~1.7 MB) parçalar üretiliyor",
       icon: HardDriveDownload,
     },
     {

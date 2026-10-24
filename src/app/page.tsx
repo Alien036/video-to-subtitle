@@ -1,6 +1,8 @@
 "use client";
 
 import React, { useState, useRef, useEffect, useCallback } from "react";
+import { onAuthStateChanged, signOut, User as FirebaseUser } from "firebase/auth";
+import { doc, onSnapshot } from "firebase/firestore";
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { toBlobURL } from "@ffmpeg/util";
 import { motion, AnimatePresence } from "framer-motion";
@@ -22,11 +24,24 @@ import {
   Clock,
   Globe,
   ShieldCheck,
-  Layers,
   Play,
   Edit3,
   ListOrdered,
+  LogOut,
+  Shield,
+  Loader2,
+  Zap,
 } from "lucide-react";
+import { auth, db } from "@/lib/firebase";
+import {
+  consumeUserQuota,
+  getUserProfile,
+  isAdminEmail,
+} from "@/lib/userService";
+import { UserProfile } from "@/types/user";
+import AuthView from "@/components/AuthView";
+import VerificationView from "@/components/VerificationView";
+import AdminPanelModal from "@/components/AdminPanelModal";
 import {
   SubtitleSegment,
   formatSrtTime,
@@ -60,6 +75,13 @@ function formatFileSize(bytes: number): string {
 }
 
 export default function VideoToSubtitlePage() {
+  // Auth & Kullanıcı Profili State'leri
+  const [authChecking, setAuthChecking] = useState<boolean>(true);
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [isAdminModalOpen, setIsAdminModalOpen] = useState<boolean>(false);
+
+  // Video & Dil State'leri
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [language, setLanguage] = useState<string>("tr");
@@ -90,6 +112,56 @@ export default function VideoToSubtitlePage() {
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const videoDurationRef = useRef<number>(0);
 
+  // Firebase Auth Oturum Takibi
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      setFirebaseUser(user);
+      if (!user) {
+        setUserProfile(null);
+        setAuthChecking(false);
+        return;
+      }
+
+      try {
+        const profile = await getUserProfile(user.uid);
+        setUserProfile(profile);
+      } catch (err) {
+        console.error("Kullanıcı profili okunamadı:", err);
+      } finally {
+        setAuthChecking(false);
+      }
+    });
+
+    return () => unsubscribeAuth();
+  }, []);
+
+  // Aktif kullanıcının Firestore belgesini canlı dinle (Admin engelleme, kota veya onay değişiklikleri anında yansısın)
+  useEffect(() => {
+    if (!firebaseUser?.uid) return;
+
+    const userDocRef = doc(db, "users", firebaseUser.uid);
+    const unsubscribeSnapshot = onSnapshot(
+      userDocRef,
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data() as UserProfile;
+          const adminFlag =
+            isAdminEmail(data.email) || data.role === "admin";
+          setUserProfile({
+            ...data,
+            role: adminFlag ? "admin" : data.role || "user",
+            isVerified: adminFlag ? true : Boolean(data.isVerified),
+          });
+        }
+      },
+      (err) => {
+        console.warn("Canlı profil senkronizasyon uyarısı:", err);
+      }
+    );
+
+    return () => unsubscribeSnapshot();
+  }, [firebaseUser?.uid]);
+
   // Cleanup Object URL on unmount or reset
   useEffect(() => {
     return () => {
@@ -99,23 +171,36 @@ export default function VideoToSubtitlePage() {
     };
   }, [audioUrl]);
 
-  const handleFileSelect = useCallback((file: File | null) => {
-    if (!file) return;
-    setErrorMessage(null);
-    setVideoFile(file);
-    setCurrentStep(0);
-    setExtractionProgress(0);
-    setCurrentChunkIndex(0);
-    setTotalChunks(0);
-    setSegments([]);
-    setSrtText("");
-    setPlainText("");
-    setStatusLog("");
-    if (audioUrl) {
-      URL.revokeObjectURL(audioUrl);
-      setAudioUrl(null);
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth);
+      setUserProfile(null);
+      setFirebaseUser(null);
+    } catch (err) {
+      console.error("Çıkış hatası:", err);
     }
-  }, [audioUrl]);
+  };
+
+  const handleFileSelect = useCallback(
+    (file: File | null) => {
+      if (!file) return;
+      setErrorMessage(null);
+      setVideoFile(file);
+      setCurrentStep(0);
+      setExtractionProgress(0);
+      setCurrentChunkIndex(0);
+      setTotalChunks(0);
+      setSegments([]);
+      setSrtText("");
+      setPlainText("");
+      setStatusLog("");
+      if (audioUrl) {
+        URL.revokeObjectURL(audioUrl);
+        setAudioUrl(null);
+      }
+    },
+    [audioUrl]
+  );
 
   const onDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -150,7 +235,6 @@ export default function VideoToSubtitlePage() {
     const ffmpeg = new FFmpeg();
 
     ffmpeg.on("log", ({ message }) => {
-      // Toplam video süresini FFmpeg loglarından yakala (progress yedeği olarak)
       const durationMatch = message.match(
         /Duration:\s*(\d{2}):(\d{2}):(\d{2})\.(\d{2})/
       );
@@ -168,8 +252,15 @@ export default function VideoToSubtitlePage() {
     });
 
     ffmpeg.on("progress", ({ progress, time }) => {
-      if (typeof progress === "number" && Number.isFinite(progress) && progress > 0 && progress <= 1) {
-        setExtractionProgress(Math.min(100, Math.max(1, Math.round(progress * 100))));
+      if (
+        typeof progress === "number" &&
+        Number.isFinite(progress) &&
+        progress > 0 &&
+        progress <= 1
+      ) {
+        setExtractionProgress(
+          Math.min(100, Math.max(1, Math.round(progress * 100)))
+        );
       } else if (time > 0 && videoDurationRef.current > 0) {
         const currentSec = time / 1_000_000;
         const pct = Math.round((currentSec / videoDurationRef.current) * 100);
@@ -191,7 +282,40 @@ export default function VideoToSubtitlePage() {
   };
 
   const startProcessing = async () => {
-    if (!videoFile) return;
+    if (!videoFile || !userProfile) return;
+
+    // Engellenme ve Kota Kontrolü
+    if (userProfile.isBlocked) {
+      setErrorMessage(
+        "Hesabınız yönetici tarafından erişime engellenmiştir."
+      );
+      return;
+    }
+
+    const isAdminUser =
+      userProfile.role === "admin" || isAdminEmail(userProfile.email);
+    const remainingQuota = Math.max(
+      0,
+      (userProfile.quotaLimit ?? 5) - (userProfile.quotaUsed || 0)
+    );
+
+    if (!isAdminUser && remainingQuota <= 0) {
+      const resetDateStr = userProfile.quotaResetAt
+        ? new Date(userProfile.quotaResetAt).toLocaleDateString("tr-TR", {
+            day: "numeric",
+            month: "long",
+            year: "numeric",
+          })
+        : "Yakında";
+      setErrorMessage(
+        `${
+          userProfile.quotaPeriod === "monthly" ? "Aylık" : "Haftalık"
+        } kullanım kotanız doldu (${userProfile.quotaUsed} / ${
+          userProfile.quotaLimit
+        } Hak). Yeni kota sıfırlanma tarihi: ${resetDateStr}. Ek kota için yöneticiyle iletişime geçebilirsiniz.`
+      );
+      return;
+    }
 
     setErrorMessage(null);
     setRetryWarning(null);
@@ -218,7 +342,6 @@ export default function VideoToSubtitlePage() {
         "WORKERFS sanal disk bağlantısı kuruluyor (RAM'e kopyalanmadan doğrudan diskten okunuyor)..."
       );
 
-      // Önceki çalışmadan kalan mount veya dosyalar varsa temizle
       try {
         await ffmpeg.unmount("/input");
       } catch {
@@ -230,7 +353,6 @@ export default function VideoToSubtitlePage() {
         // Klasör zaten mevcut olabilir
       }
 
-      // Eski çıktı dosyalarını temizle
       try {
         const rootFiles = await ffmpeg.listDir("/");
         for (const f of rootFiles) {
@@ -256,7 +378,6 @@ export default function VideoToSubtitlePage() {
         "Ses akışı Mono 16kHz MP3 olarak daraltılıyor ve 5 dakikalık (~1.7 MB) parçalara bölünüyor..."
       );
 
-      // Tek bir FFmpeg komutuyla hem tam MP3 hem de 5 dakikalık (300 sn, 48kbps) chunk_XXX.mp3 üret
       const exitCode = await ffmpeg.exec([
         "-i",
         `/input/${videoFile.name}`,
@@ -286,7 +407,6 @@ export default function VideoToSubtitlePage() {
         "chunk_%03d.mp3",
       ]);
 
-      // WORKERFS bağlantısını ayır
       try {
         await ffmpeg.unmount("/input");
       } catch {
@@ -301,7 +421,6 @@ export default function VideoToSubtitlePage() {
 
       setExtractionProgress(100);
 
-      // Tam MP3 dosyasını oku ve Blob URL oluştur, ardından WASM RAM'inden sil
       const fullAudioData = await ffmpeg.readFile("full_audio.mp3");
       const fullAudioUint8 = new Uint8Array(fullAudioData as Uint8Array);
       const fullAudioBlob = new Blob([fullAudioUint8], { type: "audio/mp3" });
@@ -315,7 +434,6 @@ export default function VideoToSubtitlePage() {
         // Yoksay
       }
 
-      // Oluşan chunk_XXX.mp3 dosyalarını listele ve sırala
       const dirFiles = await ffmpeg.listDir("/");
       const chunkFileNames = dirFiles
         .filter((node) => !node.isDir && /^chunk_\d+\.mp3$/.test(node.name))
@@ -333,9 +451,13 @@ export default function VideoToSubtitlePage() {
       setTotalChunks(chunkFileNames.length);
 
       const allSyncedSegments: SubtitleSegment[] = [];
-      const backoffDelaysSec = [3, 6, 12]; // 3 aşamalı Exponential Backoff (3sn, 6sn, 12sn)
+      const backoffDelaysSec = [3, 6, 12];
 
-      for (let chunkIndex = 0; chunkIndex < chunkFileNames.length; chunkIndex++) {
+      for (
+        let chunkIndex = 0;
+        chunkIndex < chunkFileNames.length;
+        chunkIndex++
+      ) {
         const chunkName = chunkFileNames[chunkIndex];
         setCurrentChunkIndex(chunkIndex + 1);
         setRetryWarning(null);
@@ -349,7 +471,6 @@ export default function VideoToSubtitlePage() {
           type: "audio/mp3",
         });
 
-        // Okunan chunk'ı hemen sanal bellekten silerek RAM kullanımını minimumda tut
         try {
           await ffmpeg.deleteFile(chunkName);
         } catch {
@@ -452,12 +573,21 @@ export default function VideoToSubtitlePage() {
           });
         }
 
-        // Canlı önizleme için her chunk sonrasında state'i güncelle
         const partialSrt = generateSrtContent(allSyncedSegments);
         const partialTxt = generatePlainTextContent(allSyncedSegments);
         setSegments([...allSyncedSegments]);
         setSrtText(partialSrt);
         setPlainText(partialTxt);
+      }
+
+      // Kullanım kotasını +1 artır
+      try {
+        const updatedUser = await consumeUserQuota(userProfile.uid);
+        if (updatedUser) {
+          setUserProfile(updatedUser);
+        }
+      } catch (quotaErr) {
+        console.warn("Kota güncellenirken uyarı:", quotaErr);
       }
 
       // ADIM 4: Tamamlandı!
@@ -476,7 +606,6 @@ export default function VideoToSubtitlePage() {
       setErrorMessage(msg);
       setCurrentStep(0);
     } finally {
-      // 4. KRİTİK KURAL: Bellek Sızıntısını (Memory Leak) Önlemek İçin Sanal Dosya Sistemi ve WORKERFS Temizliği
       if (ffmpeg && ffmpeg.loaded) {
         try {
           const remainingFiles = await ffmpeg.listDir("/");
@@ -577,6 +706,50 @@ export default function VideoToSubtitlePage() {
     },
   ];
 
+  // 1. Oturum kontrol edilirken yükleme ekranı
+  if (authChecking) {
+    return (
+      <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col items-center justify-center gap-3">
+        <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-500/20 to-indigo-500/20 border border-emerald-500/30">
+          <Loader2 className="h-6 w-6 animate-spin text-emerald-400" />
+        </div>
+        <p className="text-xs text-zinc-400 font-medium">
+          VoxSub Studio yükleniyor...
+        </p>
+      </div>
+    );
+  }
+
+  // 2. Kullanıcı giriş yapmadıysa veya Google ile ilk girişte @username seçmediyse AuthView göster
+  if (!firebaseUser || !userProfile || !userProfile.username) {
+    return (
+      <AuthView
+        pendingGoogleUser={firebaseUser}
+        onProfileReady={(profile) => setUserProfile(profile)}
+      />
+    );
+  }
+
+  const isUserAdmin =
+    userProfile.role === "admin" || isAdminEmail(userProfile.email);
+
+  // 3. Kullanıcı engellenmişse veya gizli doğrulama kodunu henüz girmemişse VerificationView göster
+  if (userProfile.isBlocked || (!userProfile.isVerified && !isUserAdmin)) {
+    return (
+      <VerificationView
+        profile={userProfile}
+        onVerified={(updated) => setUserProfile(updated)}
+        onSignOut={handleSignOut}
+      />
+    );
+  }
+
+  const remainingQuota = Math.max(
+    0,
+    (userProfile.quotaLimit ?? 5) - (userProfile.quotaUsed || 0)
+  );
+
+  // 4. Doğrulanmış Kullanıcı — Ana VoxSub Studio Ekranı
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 relative overflow-hidden">
       {/* Arka Plan Dekoratif Işıklandırmalar */}
@@ -586,9 +759,18 @@ export default function VideoToSubtitlePage() {
         <div className="absolute -bottom-40 left-1/3 h-80 w-80 rounded-full bg-emerald-500/5 blur-3xl" />
       </div>
 
-      {/* Üst Bilgi Çubuğu (Header) */}
+      {/* Admin Paneli Modalı */}
+      {isUserAdmin && (
+        <AdminPanelModal
+          isOpen={isAdminModalOpen}
+          onClose={() => setIsAdminModalOpen(false)}
+          currentAdminUid={userProfile.uid}
+        />
+      )}
+
+      {/* Üst Bilgi Çubuğu (Navbar - Kullanıcı Profili, Kota, Admin Paneli ve Çıkış) */}
       <header className="relative z-10 border-b border-zinc-800/80 bg-zinc-950/80 backdrop-blur-xl">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
+        <div className="mx-auto flex flex-wrap max-w-6xl items-center justify-between gap-4 px-6 py-4">
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500/20 to-indigo-500/20 border border-emerald-500/30 shadow-inner">
               <Subtitles className="h-5 w-5 text-emerald-400" />
@@ -598,7 +780,7 @@ export default function VideoToSubtitlePage() {
                 <span className="font-bold tracking-tight text-lg text-white">
                   VoxSub <span className="text-emerald-400">Studio</span>
                 </span>
-                <span className="rounded-full bg-emerald-500/10 border border-emerald-500/30 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                <span className="hidden sm:inline-block rounded-full bg-emerald-500/10 border border-emerald-500/30 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
                   Zero-Upload WORKERFS
                 </span>
               </div>
@@ -609,15 +791,64 @@ export default function VideoToSubtitlePage() {
             </div>
           </div>
 
-          <div className="hidden sm:flex items-center gap-4 text-xs text-zinc-400">
-            <div className="flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-1.5">
-              <ShieldCheck className="h-4 w-4 text-emerald-400" />
-              <span>Video Sunucuya Yüklenmez</span>
+          {/* Sağ Üst: Kullanıcı Profili, Kota Rozeti, Admin Paneli & Çıkış Yap */}
+          <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
+            {/* Kullanım Kotası Rozeti */}
+            <div
+              className={`flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium ${
+                isUserAdmin
+                  ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-300"
+                  : remainingQuota > 0
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                  : "border-red-500/40 bg-red-500/10 text-red-300"
+              }`}
+            >
+              <Zap className="h-3.5 w-3.5" />
+              {isUserAdmin ? (
+                <span>Sınırsız Hak</span>
+              ) : (
+                <span>
+                  {remainingQuota} / {userProfile.quotaLimit ?? 5} Hak (
+                  {userProfile.quotaPeriod === "monthly" ? "Aylık" : "Haftalık"}
+                  )
+                </span>
+              )}
             </div>
-            <div className="flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-1.5">
-              <Layers className="h-4 w-4 text-indigo-400" />
-              <span>5 Dk Otomatik Chunking & Multi-Key Failover</span>
+
+            {/* Kullanıcı İsim & @username Kartı */}
+            <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900/70 px-3 py-1.5">
+              <div className="text-right">
+                <p className="text-xs font-semibold text-white leading-tight">
+                  {userProfile.displayName}
+                </p>
+                <p className="text-[11px] font-mono text-emerald-400 leading-tight">
+                  @{userProfile.username}
+                </p>
+              </div>
             </div>
+
+            {/* Admin İse Admin Paneli Butonu */}
+            {isUserAdmin && (
+              <button
+                type="button"
+                onClick={() => setIsAdminModalOpen(true)}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-indigo-500/20 to-emerald-500/20 border border-indigo-500/40 px-3.5 py-2 text-xs font-semibold text-indigo-200 hover:border-emerald-400/60 hover:text-white transition-all cursor-pointer"
+              >
+                <Shield className="h-4 w-4 text-emerald-400" />
+                <span>Admin Paneli</span>
+              </button>
+            )}
+
+            {/* Çıkış Yap Butonu */}
+            <button
+              type="button"
+              onClick={handleSignOut}
+              title="Çıkış Yap"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900/80 hover:bg-zinc-800 hover:border-zinc-700 px-3 py-2 text-xs font-medium text-zinc-300 hover:text-white transition-colors cursor-pointer"
+            >
+              <LogOut className="h-3.5 w-3.5 text-zinc-400" />
+              <span className="hidden sm:inline">Çıkış Yap</span>
+            </button>
           </div>
         </div>
       </header>
@@ -647,7 +878,7 @@ export default function VideoToSubtitlePage() {
             <code className="text-emerald-300 font-mono text-xs bg-zinc-900 px-1.5 py-0.5 rounded border border-zinc-800">
               WORKERFS
             </code>{" "}
-            ile okunur, 16kHz Mono MP3&apos;e sıkıştırılır ve 10&apos;ar dakikalık
+            ile okunur, 16kHz Mono MP3&apos;e sıkıştırılır ve 5&apos;er dakikalık
             parçalar halinde yüksek doğruluklu{" "}
             <code className="text-indigo-300 font-mono text-xs bg-zinc-900 px-1.5 py-0.5 rounded border border-zinc-800">
               .SRT
@@ -772,6 +1003,11 @@ export default function VideoToSubtitlePage() {
                   </option>
                 ))}
               </select>
+
+              <div className="hidden md:flex items-center gap-1.5 text-xs text-zinc-500 pl-2">
+                <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+                <span>5 Anahtarlı Failover & Auto-Retry Aktif</span>
+              </div>
             </div>
 
             <button
@@ -914,7 +1150,6 @@ export default function VideoToSubtitlePage() {
                         {step.description}
                       </p>
 
-                      {/* Adım 2 için % İlerleme Çubuğu */}
                       {step.id === 2 && (isActive || isCompleted) && (
                         <div className="mt-3 space-y-1">
                           <div className="flex justify-between text-[11px] font-mono text-emerald-300">
@@ -938,7 +1173,6 @@ export default function VideoToSubtitlePage() {
                         </div>
                       )}
 
-                      {/* Adım 3 için Chunk İlerleme Çubuğu */}
                       {step.id === 3 &&
                         totalChunks > 0 &&
                         (isActive || isCompleted) && (
@@ -1059,7 +1293,6 @@ export default function VideoToSubtitlePage() {
                       </p>
                     </div>
 
-                    {/* İndirme ve Kopyalama Butonları */}
                     <div className="flex flex-wrap items-center gap-2.5">
                       <button
                         type="button"
@@ -1113,7 +1346,7 @@ export default function VideoToSubtitlePage() {
                     </div>
                   </div>
 
-                  {/* Sekme Seçici: Düzenlenebilir SRT Editörü | Zaman Damgalı Segment Listesi | Düz Metin */}
+                  {/* Sekme Seçici */}
                   <div className="flex items-center gap-2 border-b border-zinc-800/80 pb-3">
                     <button
                       type="button"
@@ -1153,7 +1386,6 @@ export default function VideoToSubtitlePage() {
                     </button>
                   </div>
 
-                  {/* Sekme İçeriği */}
                   {activeTab === "srt" && (
                     <div className="space-y-2">
                       <textarea

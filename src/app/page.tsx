@@ -72,6 +72,7 @@ export default function VideoToSubtitlePage() {
   const [currentChunkIndex, setCurrentChunkIndex] = useState<number>(0);
   const [totalChunks, setTotalChunks] = useState<number>(0);
   const [statusLog, setStatusLog] = useState<string>("");
+  const [retryWarning, setRetryWarning] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Output States
@@ -193,6 +194,7 @@ export default function VideoToSubtitlePage() {
     if (!videoFile) return;
 
     setErrorMessage(null);
+    setRetryWarning(null);
     setExtractionProgress(0);
     setProcessedTimeStr("00:00:00");
     setCurrentChunkIndex(0);
@@ -331,10 +333,12 @@ export default function VideoToSubtitlePage() {
       setTotalChunks(chunkFileNames.length);
 
       const allSyncedSegments: SubtitleSegment[] = [];
+      const backoffDelaysSec = [3, 6, 12]; // 3 aşamalı Exponential Backoff (3sn, 6sn, 12sn)
 
       for (let chunkIndex = 0; chunkIndex < chunkFileNames.length; chunkIndex++) {
         const chunkName = chunkFileNames[chunkIndex];
         setCurrentChunkIndex(chunkIndex + 1);
+        setRetryWarning(null);
         setStatusLog(
           `Parça ${chunkIndex + 1} / ${chunkFileNames.length} (${chunkName}) Groq Whisper Large V3 Turbo ile işleniyor...`
         );
@@ -352,35 +356,77 @@ export default function VideoToSubtitlePage() {
           // Yoksay
         }
 
-        const formData = new FormData();
-        formData.append("file", chunkFile);
-        formData.append("language", language);
-
-        const response = await fetch("/api/transcribe", {
-          method: "POST",
-          body: formData,
-        });
-
-        const responseText = await response.text();
         let result: {
           error?: string;
           text?: string;
           duration?: number;
           segments?: Array<{ start: number; end: number; text: string }>;
-        };
+        } | null = null;
 
-        try {
-          result = JSON.parse(responseText);
-        } catch {
-          throw new Error(
-            `Sunucu geçersiz bir yanıt döndürdü (HTTP ${response.status}): ${responseText.slice(0, 200)}`
-          );
+        const maxAttempts = 3;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          try {
+            const formData = new FormData();
+            formData.append("file", chunkFile);
+            formData.append("language", language);
+
+            const response = await fetch("/api/transcribe", {
+              method: "POST",
+              body: formData,
+            });
+
+            const responseText = await response.text();
+            let parsedResult: {
+              error?: string;
+              text?: string;
+              duration?: number;
+              segments?: Array<{ start: number; end: number; text: string }>;
+            };
+
+            try {
+              parsedResult = JSON.parse(responseText);
+            } catch {
+              throw new Error(
+                `Sunucu geçersiz bir yanıt döndürdü (HTTP ${response.status}): ${responseText.slice(0, 200)}`
+              );
+            }
+
+            if (!response.ok) {
+              throw new Error(
+                parsedResult.error ||
+                  `Parça ${chunkIndex + 1} işlenirken API hatası oluştu (HTTP ${response.status}): ${responseText.slice(0, 200)}`
+              );
+            }
+
+            result = parsedResult;
+            setRetryWarning(null);
+            break;
+          } catch (chunkErr: unknown) {
+            if (attempt >= maxAttempts) {
+              throw chunkErr;
+            }
+
+            const waitSeconds = backoffDelaysSec[attempt - 1] ?? 12;
+            const nextAttempt = attempt + 1;
+
+            for (let remaining = waitSeconds; remaining > 0; remaining--) {
+              const warningMsg = `API yoğunluğu algılandı, ${remaining} saniye içinde otomatik tekrar deneniyor... (Deneme ${nextAttempt}/${maxAttempts})`;
+              setRetryWarning(warningMsg);
+              setStatusLog(
+                `Parça ${chunkIndex + 1} / ${chunkFileNames.length}: ${warningMsg}`
+              );
+              await new Promise((r) => setTimeout(r, 1000));
+            }
+
+            setStatusLog(
+              `Parça ${chunkIndex + 1} / ${chunkFileNames.length} yeniden gönderiliyor... (Deneme ${nextAttempt}/${maxAttempts})`
+            );
+          }
         }
 
-        if (!response.ok) {
+        if (!result) {
           throw new Error(
-            result.error ||
-              `Parça ${chunkIndex + 1} işlenirken API hatası oluştu (HTTP ${response.status}): ${responseText.slice(0, 200)}`
+            `Parça ${chunkIndex + 1} tüm tekrar denemelere rağmen işlenemedi.`
           );
         }
 
@@ -415,18 +461,48 @@ export default function VideoToSubtitlePage() {
       }
 
       // ADIM 4: Tamamlandı!
+      setRetryWarning(null);
       setCurrentStep(4);
       setStatusLog(
         `Tüm işlemler başarıyla tamamlandı! Toplam ${allSyncedSegments.length} altyazı segmenti senkronize edildi.`
       );
     } catch (err: unknown) {
       console.error("İşlem Hatası:", err);
+      setRetryWarning(null);
       const msg =
         err instanceof Error
           ? err.message
           : "İşlem sırasında beklenmeyen bir hata meydana geldi.";
       setErrorMessage(msg);
       setCurrentStep(0);
+    } finally {
+      // 4. KRİTİK KURAL: Bellek Sızıntısını (Memory Leak) Önlemek İçin Sanal Dosya Sistemi ve WORKERFS Temizliği
+      if (ffmpeg && ffmpeg.loaded) {
+        try {
+          const remainingFiles = await ffmpeg.listDir("/");
+          for (const fileNode of remainingFiles) {
+            if (
+              !fileNode.isDir &&
+              (fileNode.name === "full_audio.mp3" ||
+                /^chunk_\d+\.mp3$/.test(fileNode.name))
+            ) {
+              try {
+                await ffmpeg.deleteFile(fileNode.name);
+              } catch {
+                // Dosya zaten silinmiş olabilir
+              }
+            }
+          }
+        } catch {
+          // listDir hatasını yoksay
+        }
+
+        try {
+          await ffmpeg.unmount("/input");
+        } catch {
+          // Zaten ayrılmış olabilir
+        }
+      }
     }
   };
 
@@ -540,7 +616,7 @@ export default function VideoToSubtitlePage() {
             </div>
             <div className="flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-1.5">
               <Layers className="h-4 w-4 text-indigo-400" />
-              <span>10 Dk Otomatik Chunking</span>
+              <span>5 Dk Otomatik Chunking & Multi-Key Failover</span>
             </div>
           </div>
         </div>
@@ -721,6 +797,26 @@ export default function VideoToSubtitlePage() {
               )}
             </button>
           </div>
+
+          {/* Otomatik Tekrar Deneme (Auto-Retry) Uyarısı */}
+          <AnimatePresence>
+            {retryWarning && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                className="mt-4 rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 flex items-center gap-3 text-amber-200"
+              >
+                <RefreshCw className="h-5 w-5 text-amber-400 shrink-0 animate-spin" />
+                <div className="text-xs sm:text-sm">
+                  <p className="font-semibold text-amber-300">
+                    Otomatik Yeniden Deneme (Auto-Retry)
+                  </p>
+                  <p className="text-amber-200/90">{retryWarning}</p>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
 
           {/* Hata Mesajı Gösterimi */}
           <AnimatePresence>

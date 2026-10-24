@@ -13,33 +13,32 @@ export default function StudioLogo() {
   return (
     <aside
       aria-label="BU Studio"
-      className="hidden md:block fixed bottom-5 right-5 sm:bottom-7 sm:right-7 z-40 select-none group"
+      className="hidden md:block fixed bottom-4 right-4 z-40 select-none group"
     >
       <div className="relative flex flex-col items-center">
         {/* Glow Arkası (Görsel Derinlik) */}
         <div
-          className={`absolute -inset-3 rounded-3xl blur-2xl transition-all duration-500 pointer-events-none ${
+          className={`absolute -inset-1.5 rounded-2xl blur-xl transition-all duration-500 pointer-events-none ${
             themeMode === "dark"
-              ? "bg-gradient-to-tr from-emerald-500/25 via-indigo-500/20 to-teal-400/20 opacity-60 group-hover:opacity-100 group-hover:scale-105"
-              : "bg-white/20 opacity-50 group-hover:opacity-80"
+              ? "bg-gradient-to-tr from-emerald-500/20 via-indigo-500/15 to-teal-400/15 opacity-50 group-hover:opacity-90"
+              : "bg-white/20 opacity-40 group-hover:opacity-75"
           }`}
         />
 
-        {/* Logo Kartı */}
+        {/* Kompakt Logo Kartı */}
         <div
           onClick={toggleTheme}
           title="BU Studio — Tıklayarak koyu/açık logo temasını değiştirebilirsiniz"
-          className={`relative cursor-pointer overflow-hidden rounded-2xl border p-4 sm:p-5 backdrop-blur-2xl shadow-2xl transition-all duration-300 hover:scale-[1.03] active:scale-[0.98] ${
+          className={`relative cursor-pointer overflow-hidden rounded-xl border p-2.5 backdrop-blur-2xl shadow-xl transition-all duration-300 hover:scale-[1.03] active:scale-[0.98] ${
             themeMode === "dark"
-              ? "border-zinc-800/80 bg-zinc-950/75 hover:border-emerald-500/50 shadow-black/80 hover:shadow-emerald-500/10"
-              : "border-zinc-200 bg-white hover:border-zinc-400 shadow-2xl shadow-black/30"
+              ? "border-zinc-800/80 bg-zinc-950/80 hover:border-emerald-500/50 shadow-black/80"
+              : "border-zinc-200 bg-white/95 hover:border-zinc-400 shadow-black/25"
           }`}
         >
-          {/* İnce Yansıma Efekti */}
-          <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/[0.06] to-transparent" />
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/[0.05] to-transparent" />
 
-          {/* Logo Görseli — Büyük ve Net */}
-          <div className="relative w-44 h-44 sm:w-56 sm:h-56 md:w-64 md:h-64 flex items-center justify-center">
+          {/* Kompakt Logo Görseli */}
+          <div className="relative w-20 h-20 flex items-center justify-center">
             <Image
               src={
                 themeMode === "dark"
@@ -47,45 +46,34 @@ export default function StudioLogo() {
                   : "/studio-logo-original.png"
               }
               alt="BU Studio Logo"
-              width={260}
-              height={260}
+              width={80}
+              height={80}
               priority
               className={`w-full h-full object-contain transition-transform duration-300 group-hover:scale-105 ${
                 themeMode === "dark"
-                  ? "filter drop-shadow-[0_4px_20px_rgba(255,255,255,0.18)]"
-                  : "filter drop-shadow-[0_4px_12px_rgba(0,0,0,0.15)]"
+                  ? "filter drop-shadow-[0_2px_10px_rgba(255,255,255,0.15)]"
+                  : "filter drop-shadow-[0_2px_6px_rgba(0,0,0,0.12)]"
               }`}
             />
           </div>
 
-          {/* Alt Marka Etiketi & Tema Değiştirme İpucu */}
-          <div className="mt-2 flex items-center justify-between gap-2 px-1 text-[11px] font-mono tracking-widest uppercase">
-            <div className="flex items-center gap-1.5">
-              <span
-                className={`h-1.5 w-1.5 rounded-full ${
-                  themeMode === "dark"
-                    ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)] animate-pulse"
-                    : "bg-zinc-800"
-                }`}
-              />
-              <span
-                className={`font-semibold tracking-wider ${
-                  themeMode === "dark"
-                    ? "text-zinc-300 group-hover:text-emerald-300"
-                    : "text-zinc-800"
-                }`}
-              >
-                BU STUDIO
-              </span>
-            </div>
+          {/* Alt Marka Etiketi */}
+          <div className="mt-1 flex items-center justify-center gap-1.5 text-[9px] font-mono tracking-wider uppercase">
             <span
-              className={`text-[9px] lowercase tracking-normal px-1.5 py-0.5 rounded ${
+              className={`h-1.5 w-1.5 rounded-full ${
                 themeMode === "dark"
-                  ? "bg-zinc-900 text-zinc-500 border border-zinc-800/80"
-                  : "bg-zinc-100 text-zinc-600 border border-zinc-200"
+                  ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.8)] animate-pulse"
+                  : "bg-zinc-800"
+              }`}
+            />
+            <span
+              className={`font-semibold ${
+                themeMode === "dark"
+                  ? "text-zinc-300 group-hover:text-emerald-300"
+                  : "text-zinc-800"
               }`}
             >
-              {themeMode === "dark" ? "koyu" : "açık"}
+              BU STUDIO
             </span>
           </div>
         </div>

@@ -23,7 +23,11 @@ let roundRobinCounter = Math.floor(Math.random() * 1000);
 const MUSIC_BASE_PROMPT =
   "Şarkı sözleri, Türkçe rap, pop, nakarat, kafiyeli vokal kaydı.";
 
-const GEMINI_MODELS_CHAIN = ["gemini-2.5-flash", "gemini-2.0-flash"];
+const GEMINI_MODELS = [
+  "gemini-flash-latest",
+  "gemini-3.8-flash",
+  "gemini-pro-latest",
+];
 
 const MUSIC_MODELS_CHAIN = [
   "openai/gpt-oss-120b",
@@ -239,7 +243,7 @@ export async function POST(request: NextRequest) {
       const base64Audio = Buffer.from(fileArrayBuffer).toString("base64");
       const geminiStartIndex = currentCounter % geminiKeys.length;
 
-      for (const geminiModel of GEMINI_MODELS_CHAIN) {
+      for (const geminiModel of GEMINI_MODELS) {
         for (let offset = 0; offset < geminiKeys.length; offset++) {
           const keyIndex = (geminiStartIndex + offset) % geminiKeys.length;
           const apiKey = geminiKeys[keyIndex];
@@ -317,7 +321,7 @@ ${previousContext ? `Önceki parçanın son satırı: "${previousContext}"` : ""
       }
 
       console.warn(
-        "[/api/transcribe-music] Gemini modelleri (gemini-2.5-flash / gemini-2.0-flash) yetki hatası verdi. Otomatik olarak GROQ_API_KEYS (whisper-large-v3 + openai/gpt-oss-120b) yedek (fallback) sistemi devreye sokuluyor..."
+        "[/api/transcribe-music] Gemini modelleri (gemini-flash-latest / gemini-3.8-flash / gemini-pro-latest) yetki hatası verdi. Otomatik olarak GROQ_API_KEYS (whisper-large-v3 + openai/gpt-oss-120b) yedek (fallback) sistemi devreye sokuluyor..."
       );
     }
 

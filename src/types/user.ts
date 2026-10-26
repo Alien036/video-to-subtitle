@@ -7,6 +7,7 @@ export interface UserProfile {
   username: string;
   photoURL?: string | null;
   role: "admin" | "user";
+  isAdmin?: boolean;
   isVerified: boolean;
   isBlocked: boolean;
   quotaPeriod: QuotaPeriod;

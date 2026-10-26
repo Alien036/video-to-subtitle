@@ -25,11 +25,13 @@ import {
   ArrowRight,
   ShieldCheck,
 } from "lucide-react";
-import { auth, googleProvider } from "@/lib/firebase";
+import { auth, db, googleProvider } from "@/lib/firebase";
+import { doc, updateDoc } from "firebase/firestore";
 import {
   createUserProfile,
   getEmailByUsername,
   getUserProfile,
+  isAdminEmail,
   isUsernameTaken,
   normalizeUsername,
 } from "@/lib/userService";
@@ -248,10 +250,39 @@ export default function AuthView({
         targetEmail,
         loginPassword
       );
-      const existingProfile = await getUserProfile(credential.user.uid);
+      const existingProfile = await getUserProfile(
+        credential.user.uid,
+        credential.user.email || targetEmail
+      );
 
       if (existingProfile) {
-        onProfileReady(existingProfile);
+        const adminFlag =
+          isAdminEmail(credential.user.email || existingProfile.email) ||
+          existingProfile.role === "admin";
+        if (
+          adminFlag &&
+          (existingProfile.role !== "admin" ||
+            !existingProfile.isAdmin ||
+            !existingProfile.isVerified)
+        ) {
+          await updateDoc(doc(db, "users", credential.user.uid), {
+            role: "admin",
+            isAdmin: true,
+            isVerified: true,
+            isBlocked: false,
+            quotaLimit: 999999,
+          }).catch(() => {});
+          onProfileReady({
+            ...existingProfile,
+            role: "admin",
+            isAdmin: true,
+            isVerified: true,
+            isBlocked: false,
+            quotaLimit: 999999,
+          });
+        } else {
+          onProfileReady(existingProfile);
+        }
       } else {
         // Eğer Auth kaydı var ama Firestore kaydı yoksa profil tamamlama ekranını aç
         setGoogleStepUser(credential.user);
@@ -337,9 +368,35 @@ export default function AuthView({
       const result = await signInWithPopup(auth, googleProvider);
       const user = result.user;
 
-      const existingProfile = await getUserProfile(user.uid);
+      const existingProfile = await getUserProfile(user.uid, user.email);
       if (existingProfile && existingProfile.username) {
-        onProfileReady(existingProfile);
+        const adminFlag =
+          isAdminEmail(user.email || existingProfile.email) ||
+          existingProfile.role === "admin";
+        if (
+          adminFlag &&
+          (existingProfile.role !== "admin" ||
+            !existingProfile.isAdmin ||
+            !existingProfile.isVerified)
+        ) {
+          await updateDoc(doc(db, "users", user.uid), {
+            role: "admin",
+            isAdmin: true,
+            isVerified: true,
+            isBlocked: false,
+            quotaLimit: 999999,
+          }).catch(() => {});
+          onProfileReady({
+            ...existingProfile,
+            role: "admin",
+            isAdmin: true,
+            isVerified: true,
+            isBlocked: false,
+            quotaLimit: 999999,
+          });
+        } else {
+          onProfileReady(existingProfile);
+        }
       } else {
         // İlk kez Google ile giriş yapan kullanıcıya "Son Bir Adım: Profilini Tamamla" modalını göster
         setGoogleStepUser(user);

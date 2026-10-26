@@ -12,11 +12,20 @@ import {
 import { db } from "@/lib/firebase";
 import { AppSettings, QuotaPeriod, UserProfile } from "@/types/user";
 
-const ADMIN_EMAIL = (
-  process.env.NEXT_PUBLIC_ADMIN_EMAIL || "umutakilli4646@gmail.com"
-)
-  .trim()
-  .toLowerCase();
+const DEFAULT_ADMIN_EMAILS =
+  "umutakilli4646@gmail.com,mali190346@gmail.com";
+
+export function getAdminEmails(): string[] {
+  const combined = `${process.env.NEXT_PUBLIC_ADMIN_EMAIL || ""},${DEFAULT_ADMIN_EMAILS}`;
+  return Array.from(
+    new Set(
+      combined
+        .split(",")
+        .map((e) => e.trim().toLowerCase())
+        .filter(Boolean)
+    )
+  );
+}
 
 export const DEFAULT_VERIFICATION_CODE = "VOXSUB2026";
 export const DEFAULT_QUOTA_LIMIT = 5;
@@ -24,7 +33,8 @@ export const DEFAULT_QUOTA_PERIOD: QuotaPeriod = "weekly";
 
 export function isAdminEmail(email?: string | null): boolean {
   if (!email) return false;
-  return email.trim().toLowerCase() === ADMIN_EMAIL;
+  const adminEmails = getAdminEmails();
+  return adminEmails.includes(email.trim().toLowerCase());
 }
 
 export function normalizeUsername(raw: string): string {
@@ -122,9 +132,13 @@ export async function getEmailByUsername(
 }
 
 /**
- * UID ile kullanıcı profilini getirir ve kota sıfırlama zamanı geçmişse otomatik sıfırlar.
+ * UID ile kullanıcı profilini getirir, admin e-postasıysa otomatik admin'e yükseltir
+ * ve kota sıfırlama zamanı geçmişse otomatik sıfırlar.
  */
-export async function getUserProfile(uid: string): Promise<UserProfile | null> {
+export async function getUserProfile(
+  uid: string,
+  authEmail?: string | null
+): Promise<UserProfile | null> {
   const userRef = doc(db, "users", uid);
   const snap = await getDoc(userRef);
 
@@ -134,7 +148,34 @@ export async function getUserProfile(uid: string): Promise<UserProfile | null> {
 
   const data = snap.data() as UserProfile;
   const now = Date.now();
-  const isUserAdmin = isAdminEmail(data.email) || data.role === "admin";
+  const effectiveEmail = data.email || authEmail || "";
+  const isUserAdmin =
+    isAdminEmail(effectiveEmail) ||
+    data.role === "admin" ||
+    Boolean(data.isAdmin);
+
+  // Admin e-postasıysa (daha önce user olarak kayıt olmuş olsa bile) Firestore'da otomatik Admin'e yükselt
+  if (
+    isUserAdmin &&
+    (data.role !== "admin" ||
+      !data.isAdmin ||
+      !data.isVerified ||
+      data.isBlocked)
+  ) {
+    const adminUpgrades: Partial<UserProfile> = {
+      role: "admin",
+      isAdmin: true,
+      isVerified: true,
+      isBlocked: false,
+      quotaLimit: 999999,
+      lastLoginAt: now,
+    };
+    await updateDoc(userRef, adminUpgrades);
+    return {
+      ...data,
+      ...adminUpgrades,
+    };
+  }
 
   // Kota periyodu süresi dolmuşsa otomatik sıfırla
   if (data.quotaResetAt && now >= data.quotaResetAt) {
@@ -151,26 +192,17 @@ export async function getUserProfile(uid: string): Promise<UserProfile | null> {
       ...data,
       ...updatedFields,
       role: isUserAdmin ? "admin" : data.role || "user",
+      isAdmin: isUserAdmin,
       isVerified: isUserAdmin ? true : Boolean(data.isVerified),
     };
   }
 
-  // Admin e-postasıysa rol ve doğrulamayı garanti altına al
-  if (isUserAdmin && (data.role !== "admin" || !data.isVerified)) {
-    await updateDoc(userRef, {
-      role: "admin",
-      isVerified: true,
-      isBlocked: false,
-    });
-    return {
-      ...data,
-      role: "admin",
-      isVerified: true,
-      isBlocked: false,
-    };
-  }
-
-  return data;
+  return {
+    ...data,
+    role: isUserAdmin ? "admin" : data.role || "user",
+    isAdmin: isUserAdmin,
+    isVerified: isUserAdmin ? true : Boolean(data.isVerified),
+  };
 }
 
 /**
@@ -195,6 +227,7 @@ export async function createUserProfile(params: {
     username: cleanUsername,
     photoURL: params.photoURL || null,
     role: adminFlag ? "admin" : "user",
+    isAdmin: adminFlag,
     isVerified: adminFlag ? true : false,
     isBlocked: false,
     quotaPeriod: settings.defaultQuotaPeriod,
@@ -224,15 +257,48 @@ export async function consumeUserQuota(uid: string): Promise<UserProfile | null>
 }
 
 /**
- * Admin Paneli için tüm kullanıcıları getirir.
+ * Admin Paneli için tüm kullanıcıları getirir (Admin listesindeki e-postaları otomatik yükseltir).
  */
 export async function getAllUsersForAdmin(): Promise<UserProfile[]> {
   const usersRef = collection(db, "users");
   const snapshot = await getDocs(usersRef);
   const list: UserProfile[] = [];
+  const upgradePromises: Promise<unknown>[] = [];
+
   snapshot.forEach((docSnap) => {
-    list.push(docSnap.data() as UserProfile);
+    const data = docSnap.data() as UserProfile;
+    const adminFlag =
+      isAdminEmail(data.email) ||
+      data.role === "admin" ||
+      Boolean(data.isAdmin);
+
+    if (
+      adminFlag &&
+      (data.role !== "admin" || !data.isAdmin || !data.isVerified)
+    ) {
+      upgradePromises.push(
+        updateDoc(doc(db, "users", docSnap.id), {
+          role: "admin",
+          isAdmin: true,
+          isVerified: true,
+          isBlocked: false,
+          quotaLimit: 999999,
+        }).catch(() => {})
+      );
+    }
+
+    list.push({
+      ...data,
+      role: adminFlag ? "admin" : data.role || "user",
+      isAdmin: adminFlag,
+      isVerified: adminFlag ? true : Boolean(data.isVerified),
+    });
   });
+
+  if (upgradePromises.length > 0) {
+    await Promise.all(upgradePromises);
+  }
+
   return list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 }
 

@@ -3,7 +3,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import Image from "next/image";
 import { onAuthStateChanged, signOut, User as FirebaseUser } from "firebase/auth";
-import { doc, onSnapshot } from "firebase/firestore";
+import { doc, onSnapshot, updateDoc } from "firebase/firestore";
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { toBlobURL } from "@ffmpeg/util";
 import { motion, AnimatePresence } from "framer-motion";
@@ -286,8 +286,36 @@ export default function VideoToSubtitlePage() {
       }
 
       try {
-        const profile = await getUserProfile(user.uid);
-        setUserProfile(profile);
+        const profile = await getUserProfile(user.uid, user.email);
+        if (profile) {
+          const adminByEmail = isAdminEmail(user.email || profile.email);
+          if (
+            adminByEmail &&
+            (profile.role !== "admin" ||
+              !profile.isAdmin ||
+              !profile.isVerified)
+          ) {
+            await updateDoc(doc(db, "users", user.uid), {
+              role: "admin",
+              isAdmin: true,
+              isVerified: true,
+              isBlocked: false,
+              quotaLimit: 999999,
+            }).catch(() => {});
+            setUserProfile({
+              ...profile,
+              role: "admin",
+              isAdmin: true,
+              isVerified: true,
+              isBlocked: false,
+              quotaLimit: 999999,
+            });
+          } else {
+            setUserProfile(profile);
+          }
+        } else {
+          setUserProfile(null);
+        }
       } catch (err) {
         console.error("Kullanıcı profili okunamadı:", err);
       } finally {
@@ -309,11 +337,32 @@ export default function VideoToSubtitlePage() {
         if (snap.exists()) {
           const data = snap.data() as UserProfile;
           const adminFlag =
-            isAdminEmail(data.email) || data.role === "admin";
+            isAdminEmail(data.email || firebaseUser.email) ||
+            data.role === "admin" ||
+            Boolean(data.isAdmin);
+
+          if (
+            adminFlag &&
+            (data.role !== "admin" ||
+              !data.isAdmin ||
+              !data.isVerified ||
+              data.isBlocked)
+          ) {
+            updateDoc(userDocRef, {
+              role: "admin",
+              isAdmin: true,
+              isVerified: true,
+              isBlocked: false,
+              quotaLimit: 999999,
+            }).catch(() => {});
+          }
+
           setUserProfile({
             ...data,
             role: adminFlag ? "admin" : data.role || "user",
+            isAdmin: adminFlag,
             isVerified: adminFlag ? true : Boolean(data.isVerified),
+            isBlocked: adminFlag ? false : Boolean(data.isBlocked),
           });
         }
       },
@@ -323,7 +372,7 @@ export default function VideoToSubtitlePage() {
     );
 
     return () => unsubscribeSnapshot();
-  }, [firebaseUser?.uid]);
+  }, [firebaseUser?.uid, firebaseUser?.email]);
 
   // Cleanup Object URL on unmount or reset
   useEffect(() => {

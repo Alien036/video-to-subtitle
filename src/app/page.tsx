@@ -243,10 +243,11 @@ export default function VideoToSubtitlePage() {
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [isAdminModalOpen, setIsAdminModalOpen] = useState<boolean>(false);
 
-  // Video & Dil State'leri
+  // Video, Dil & Şarkı/Müzik Modu State'leri
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [language, setLanguage] = useState<string>("tr");
+  const [isMusicMode, setIsMusicMode] = useState<boolean>(false);
 
   // Stepper & Progress States
   // 0: Beklemede, 1: FFmpeg Hazırlanıyor, 2: WORKERFS Ses Ayıklama, 3: Groq Whisper API, 4: Tamamlandı
@@ -563,37 +564,68 @@ export default function VideoToSubtitlePage() {
       }
 
       const segmentTime = CHUNK_DURATION_SECONDS; // 240 sn (4 dakika)
-      setStatusLog(
-        "İnsan sesi izolasyonu ve fon müziği bastırma (120Hz-4000Hz Vocal Band + afftdn + dynaudnorm) aktif: 16kHz Mono 64kbps MP3 parçaları (~1.9 MB / 4 dk) üretiliyor..."
-      );
+      let exitCode = 0;
 
-      const exitCode = await activeFfmpeg.exec([
-        "-vn",
-        "-sn",
-        "-i",
-        `/input/${videoFile.name}`,
-        "-map",
-        "0:a:0",
-        "-ac",
-        "1",
-        "-ar",
-        "16000", // KESİNLİKLE 16kHz (Kelime yutulmasını önler!)
-        // İNSAN SESİ İZOLASYONU VE FON MÜZİĞİ BASTIRMA FİLTRESİ:
-        // highpass=f=120,lowpass=f=4000 -> Fon müziğinin bas ve tiz enstrümanlarını kesip Vocal Band (120Hz - 4000Hz) aralığını öne çıkarır
-        // afftdn=nf=-25 -> Arka plan müziğini ve gürültüyü FFT ile sönümler
-        // dynaudnorm=f=150:g=15 -> Kısık sesle/uzaktan konuşan kişinin sesini otomatik yükseltir ve dengeler!
-        "-af",
-        "highpass=f=120,lowpass=f=4000,afftdn=nf=-25,dynaudnorm=f=150:g=15",
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        "64k", // 64kbps kristal netlik (240 saniyede sadece ~1.9 MB tutar!)
-        "-f",
-        "segment",
-        "-segment_time",
-        "240", // 4 dakikalık parçalar (~1.9 MB/parça)
-        "chunk_%03d.mp3",
-      ]);
+      if (isMusicMode) {
+        setStatusLog(
+          "🎵 Şarkı / Müzik Modu aktif: Geniş vokal ve autotune frekanslı (highpass=60Hz + dynaudnorm) 16kHz Mono 64kbps MP3 parçaları üretiliyor..."
+        );
+        exitCode = await activeFfmpeg.exec([
+          "-vn",
+          "-sn",
+          "-i",
+          "/input/" + videoFile.name,
+          "-map",
+          "0:a:0",
+          "-ac",
+          "1",
+          "-ar",
+          "16000",
+          "-af",
+          "highpass=f=60,dynaudnorm=f=200:g=11",
+          "-c:a",
+          "libmp3lame",
+          "-b:a",
+          "64k",
+          "-f",
+          "segment",
+          "-segment_time",
+          "240",
+          "chunk_%03d.mp3",
+        ]);
+      } else {
+        setStatusLog(
+          "İnsan sesi izolasyonu ve fon müziği bastırma (120Hz-4000Hz Vocal Band + afftdn + dynaudnorm) aktif: 16kHz Mono 64kbps MP3 parçaları (~1.9 MB / 4 dk) üretiliyor..."
+        );
+
+        exitCode = await activeFfmpeg.exec([
+          "-vn",
+          "-sn",
+          "-i",
+          `/input/${videoFile.name}`,
+          "-map",
+          "0:a:0",
+          "-ac",
+          "1",
+          "-ar",
+          "16000", // KESİNLİKLE 16kHz (Kelime yutulmasını önler!)
+          // İNSAN SESİ İZOLASYONU VE FON MÜZİĞİ BASTIRMA FİLTRESİ:
+          // highpass=f=120,lowpass=f=4000 -> Fon müziğinin bas ve tiz enstrümanlarını kesip Vocal Band (120Hz - 4000Hz) aralığını öne çıkarır
+          // afftdn=nf=-25 -> Arka plan müziğini ve gürültüyü FFT ile sönümler
+          // dynaudnorm=f=150:g=15 -> Kısık sesle/uzaktan konuşan kişinin sesini otomatik yükseltir ve dengeler!
+          "-af",
+          "highpass=f=120,lowpass=f=4000,afftdn=nf=-25,dynaudnorm=f=150:g=15",
+          "-c:a",
+          "libmp3lame",
+          "-b:a",
+          "64k", // 64kbps kristal netlik (240 saniyede sadece ~1.9 MB tutar!)
+          "-f",
+          "segment",
+          "-segment_time",
+          "240", // 4 dakikalık parçalar (~1.9 MB/parça)
+          "chunk_%03d.mp3",
+        ]);
+      }
 
       if (exitCode !== 0) {
         throw new Error(
@@ -688,7 +720,11 @@ export default function VideoToSubtitlePage() {
                 formData.append("previousContext", previousContext);
               }
 
-              const response = await fetch("/api/transcribe", {
+              const targetEndpoint = isMusicMode
+                ? "/api/transcribe-music"
+                : "/api/transcribe";
+
+              const response = await fetch(targetEndpoint, {
                 method: "POST",
                 body: formData,
               });
@@ -765,8 +801,9 @@ export default function VideoToSubtitlePage() {
           );
         }
 
-        // Eğer sunucuda LLM redaksiyonu henüz uygulanmadıysa /api/refine üzerinden kesin olarak geçir
+        // Eğer konuşma modundaysa ve sunucuda LLM redaksiyonu henüz uygulanmadıysa /api/refine üzerinden kesin olarak geçir
         if (
+          !isMusicMode &&
           !result.llmApplied &&
           Array.isArray(result.segments) &&
           result.segments.length > 0
@@ -806,7 +843,22 @@ export default function VideoToSubtitlePage() {
 
         const validChunkTexts: string[] = [];
 
-        if (Array.isArray(result.segments)) {
+        if (isMusicMode) {
+          // Şarkı / Müzik Modu: Nakarat tekrarlarını ve vokal satırlarını silmeden doğrudan ekle
+          if (Array.isArray(result.segments)) {
+            for (const seg of result.segments) {
+              const lyricsLine = String(seg.text || "").trim();
+              if (!lyricsLine) continue;
+              allSyncedSegments.push({
+                id: allSyncedSegments.length + 1,
+                start: Number(seg.start) + cumulativeOffset,
+                end: Number(seg.end) + cumulativeOffset,
+                text: lyricsLine,
+              });
+              validChunkTexts.push(lyricsLine);
+            }
+          }
+        } else if (Array.isArray(result.segments)) {
           for (let sIdx = 0; sIdx < result.segments.length; sIdx++) {
             const seg = result.segments[sIdx];
             const cleanText = collapseRepeatedPhrases(String(seg.text || ""));
@@ -1317,9 +1369,35 @@ export default function VideoToSubtitlePage() {
                 ))}
               </select>
 
-              <div className="hidden md:flex items-center gap-1.5 text-xs text-zinc-500 pl-2">
+              {/* Tek Tıkla Şarkı / Müzik Modu Toggle Butonu */}
+              <button
+                type="button"
+                disabled={isProcessing}
+                onClick={() => setIsMusicMode((prev) => !prev)}
+                className={`inline-flex items-center gap-2 rounded-xl border px-3.5 py-2 text-xs sm:text-sm font-semibold transition-all duration-200 cursor-pointer disabled:opacity-50 ${
+                  isMusicMode
+                    ? "border-fuchsia-400/80 bg-gradient-to-r from-fuchsia-600/30 via-purple-600/30 to-pink-500/30 text-fuchsia-200 shadow-[0_0_20px_rgba(217,70,239,0.45)] ring-1 ring-fuchsia-400/50"
+                    : "border-zinc-800 bg-zinc-950/90 text-zinc-400 hover:border-purple-500/50 hover:text-zinc-200"
+                }`}
+              >
+                <Music
+                  className={`h-4 w-4 ${
+                    isMusicMode
+                      ? "text-fuchsia-300 animate-pulse"
+                      : "text-zinc-400"
+                  }`}
+                />
+                <span>🎵 Şarkı / Müzik Modu</span>
+                {isMusicMode && (
+                  <span className="rounded-full bg-fuchsia-500/30 border border-fuchsia-400/50 px-2 py-0.5 text-[10px] font-bold tracking-wide text-fuchsia-100">
+                    Şarkı &amp; Rap Sözü Odaklı AI Aktif
+                  </span>
+                )}
+              </button>
+
+              <div className="hidden lg:flex items-center gap-1.5 text-xs text-zinc-500 pl-1">
                 <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
-                <span>5 Anahtarlı Failover & Auto-Retry Aktif</span>
+                <span>5 Anahtarlı Failover &amp; Auto-Retry Aktif</span>
               </div>
             </div>
 

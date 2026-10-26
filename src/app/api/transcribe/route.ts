@@ -27,6 +27,60 @@ export interface VerboseTranscriptionResponse {
 // Round-Robin sayacı (aynı sunucu örneği içinde yükü eşit dağıtmak için)
 let roundRobinCounter = Math.floor(Math.random() * 1000);
 
+const DEFAULT_TURKISH_PROMPT =
+  "Bu bir Türkçe konuşma kaydıdır. Noktalama işaretlerine ve Türkçe imla kurallarına dikkat et.";
+
+const HALLUCINATION_PATTERNS: RegExp[] = [
+  /^altyazı\s*m\.?\s*k\.?$/i,
+  /^altyazi\s*m\.?\s*k\.?$/i,
+  /abone\s+olmayı\s+unutmayın/i,
+  /kanala\s+abone\s+ol/i,
+  /izlediğiniz\s+için\s+teşekkür/i,
+  /dinlediğiniz\s+için\s+teşekkür/i,
+  /beğenmeyi\s+ve\s+abone\s+olmayı/i,
+  /videoyu\s+beğenmeyi\s+unutmayın/i,
+  /^altyazı\s*:?\s*$/i,
+  /^çeviri\s*:?\s*$/i,
+  /amara\.org/i,
+  /subtitles?\s+by/i,
+  /^teşekkürler\.?$/i,
+];
+
+export function isHallucinatedSegment(seg: {
+  text?: string;
+  no_speech_prob?: number;
+}): boolean {
+  if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.6) {
+    return true;
+  }
+
+  const rawText = (seg.text ?? "").trim();
+  if (!rawText) {
+    return true;
+  }
+
+  // Sadece noktalama işareti, üç nokta veya müzik sembollerinden oluşuyorsa filtrele
+  if (/^[\s.…♪♫\-_*,!?;:()[\]"']+$/u.test(rawText)) {
+    return true;
+  }
+
+  const normalized = rawText
+    .replace(/^[.…\s,-]+|[.…\s!-]+$/g, "")
+    .trim();
+
+  if (!normalized) {
+    return true;
+  }
+
+  for (const pattern of HALLUCINATION_PATTERNS) {
+    if (pattern.test(normalized)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function getApiKeysPool(): string[] {
   return (process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY || "")
     .split(",")
@@ -69,10 +123,16 @@ export async function POST(request: NextRequest) {
     const formData = await request.formData();
     const uploadedFile = formData.get("file");
     const languageInput = formData.get("language");
+    const previousContextInput = formData.get("previousContext");
     const language =
       typeof languageInput === "string" && languageInput.trim().length > 0
         ? languageInput.trim()
         : "tr";
+    const previousContext =
+      typeof previousContextInput === "string" &&
+      previousContextInput.trim().length > 0
+        ? previousContextInput.trim()
+        : "";
 
     if (!uploadedFile || !(uploadedFile instanceof File)) {
       return NextResponse.json(
@@ -106,31 +166,41 @@ export async function POST(request: NextRequest) {
 
         try {
           const groq = new Groq({ apiKey: activeApiKey });
-          const retryableFile = new File([fileArrayBuffer], fileName, {
+          const audioFile = new File([fileArrayBuffer], fileName, {
             type: fileType,
           });
 
           const transcription = (await groq.audio.transcriptions.create({
-            file: retryableFile,
-            model: "whisper-large-v3-turbo",
-            language: language === "auto" ? undefined : language,
+            file: audioFile,
+            model: "whisper-large-v3",
+            language: language === "auto" ? undefined : language || "tr",
             response_format: "verbose_json",
-            timestamp_granularities: ["segment"],
-            temperature: 0,
+            temperature: 0, // KRİTİK: Modelin kelime uydurmasını ve halüsinasyonu engeller!
+            prompt:
+              previousContext ||
+              DEFAULT_TURKISH_PROMPT, // Bağlam koruma
           })) as unknown as VerboseTranscriptionResponse;
 
-          return NextResponse.json({
-            text: transcription.text ?? "",
-            segments: Array.isArray(transcription.segments)
-              ? transcription.segments.map((seg, idx) => ({
+          const filteredSegments = Array.isArray(transcription.segments)
+            ? transcription.segments
+                .filter((seg) => !isHallucinatedSegment(seg))
+                .map((seg, idx) => ({
                   id: seg.id ?? idx,
                   start: Number(seg.start) || 0,
                   end: Number(seg.end) || 0,
                   text: (seg.text ?? "").trim(),
+                  no_speech_prob:
+                    typeof seg.no_speech_prob === "number"
+                      ? seg.no_speech_prob
+                      : 0,
                 }))
-              : [],
+            : [];
+
+          return NextResponse.json({
+            text: filteredSegments.map((s) => s.text).join(" ").trim(),
+            segments: filteredSegments,
             language: transcription.language ?? language,
-            duration: transcription.duration ?? 0,
+            duration: Number(transcription.duration) || 0,
           });
         } catch (err: unknown) {
           lastError = err;

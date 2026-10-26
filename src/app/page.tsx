@@ -51,9 +51,58 @@ import {
 
 type ProcessingStep = 0 | 1 | 2 | 3 | 4;
 
-const CHUNK_DURATION_SECONDS = 300; // 5 dakika = 300 saniye (~1.1 MB / parça @ 32kbps, Vercel 4.5 MB sınırının altında)
+const CHUNK_DURATION_SECONDS = 300; // 5 dakika = 300 saniye (~1.7 MB / parça @ 48kbps, Vercel 4.5 MB sınırının altında)
 const MAX_CHUNK_BYTES = 4 * 1024 * 1024; // 4.0 MB (Vercel 4.5 MB sınırının altında güvenli parça limiti)
-const TRANSCRIPTION_CONCURRENCY = 2; // 2'şerli paralel API gönderimi
+
+const HALLUCINATION_PATTERNS: RegExp[] = [
+  /^altyazı\s*m\.?\s*k\.?$/i,
+  /^altyazi\s*m\.?\s*k\.?$/i,
+  /abone\s+olmayı\s+unutmayın/i,
+  /kanala\s+abone\s+ol/i,
+  /izlediğiniz\s+için\s+teşekkür/i,
+  /dinlediğiniz\s+için\s+teşekkür/i,
+  /beğenmeyi\s+ve\s+abone\s+olmayı/i,
+  /videoyu\s+beğenmeyi\s+unutmayın/i,
+  /^altyazı\s*:?\s*$/i,
+  /^çeviri\s*:?\s*$/i,
+  /amara\.org/i,
+  /subtitles?\s+by/i,
+  /^teşekkürler\.?$/i,
+];
+
+function isHallucinatedSegment(seg: {
+  text?: string;
+  no_speech_prob?: number;
+}): boolean {
+  if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.6) {
+    return true;
+  }
+
+  const rawText = String(seg.text ?? "").trim();
+  if (!rawText) {
+    return true;
+  }
+
+  if (/^[\s.…♪♫\-_*,!?;:()[\]"']+$/u.test(rawText)) {
+    return true;
+  }
+
+  const normalized = rawText
+    .replace(/^[.…\s,-]+|[.…\s!-]+$/g, "")
+    .trim();
+
+  if (!normalized) {
+    return true;
+  }
+
+  for (const pattern of HALLUCINATION_PATTERNS) {
+    if (pattern.test(normalized)) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 function getChunkMimeType(filename: string): string {
   const ext = (filename.split(".").pop() || "").toLowerCase();
@@ -495,11 +544,11 @@ export default function VideoToSubtitlePage() {
         needsFastCompression = copyExitCode !== 0;
       }
 
-      // 2. WAV/FLAC, Video veya >4.0 MB Chunk İçin Otomatik Ultra-Hızlı Sıkıştırma Modu
+      // 2. WAV/FLAC, Video veya >4.0 MB Chunk İçin Whisper Doğal Frekansında (16kHz 48kbps) Sıkıştırma Modu
       if (needsFastCompression) {
         segmentTime = 300;
         setStatusLog(
-          "Ultra-hızlı sıkıştırma modu aktif: 12kHz Mono 32kbps MP3 parçaları (~1.1 MB / 5 dk) üretiliyor..."
+          "Yüksek netlikli sıkıştırma modu aktif: 16kHz Mono 48kbps MP3 parçaları (~1.7 MB / 5 dk) üretiliyor..."
         );
 
         const exitCode = await activeFfmpeg.exec([
@@ -512,13 +561,13 @@ export default function VideoToSubtitlePage() {
           "-ac",
           "1", // Mono (Tek kanal)
           "-ar",
-          "12000", // 16kHz yerine 12kHz (CPU yükünü %35 azaltır, Whisper için fazlasıyla yeterlidir)
+          "16000", // Whisper'ın doğal (native) 16kHz örnekleme frekansı (s, ş, ç, t harflerinde yüksek netlik)
           "-c:a",
           "libmp3lame",
           "-b:a",
-          "32k", // 32kbps (5 dakikalık parça sadece ~1.1 MB tutar, mobilde çok hızlı yüklenir)
+          "48k", // 48kbps (300 saniyelik parça ~1.7 MB tutar, kristal netliğinde ses)
           "-q:a",
-          "9", // En hızlı MP3 algoritması (CPU'yu yormaz)
+          "5", // Yüksek kalite / hız dengesi
           "-f",
           "segment",
           "-segment_time",
@@ -555,7 +604,7 @@ export default function VideoToSubtitlePage() {
         );
       }
 
-      // ADIM 3: Ses Parçaları Yapay Zeka (Groq Whisper) ile 2'şerli Paralel Altyazıya Dönüştürülüyor
+      // ADIM 3: Ses Parçaları Yapay Zeka (Groq Whisper Large V3) ile Kesin Zaman Damgalı ve Bağlam Korumalı Altyazıya Dönüştürülüyor
       setCurrentStep(3);
       setTotalChunks(chunkFileNames.length);
 
@@ -564,19 +613,26 @@ export default function VideoToSubtitlePage() {
       let completedChunksCount = 0;
       const videoAudioBuffers: Uint8Array<ArrayBuffer>[] = [];
 
-      const transcribeSingleChunk = async (
-        chunkIndex: number
-      ): Promise<Array<{ start: number; end: number; text: string }>> => {
+      // 4. Kesin Zaman Damgası (Exact Duration Offset) ve Bağlam Aktarımı (previousContext)
+      let cumulativeOffset = 0;
+      let previousContext = "";
+
+      for (let chunkIndex = 0; chunkIndex < chunkFileNames.length; chunkIndex++) {
         const chunkName = chunkFileNames[chunkIndex];
 
-        // 3. Anlık Bellek Yönetimi: Sadece sırası gelen parçayı MEMFS'ten oku
+        setRetryWarning(null);
+        setStatusLog(
+          `Parça ${chunkIndex + 1} / ${chunkFileNames.length} Groq Whisper Large V3 ile işleniyor...`
+        );
+
+        // Anlık Bellek Yönetimi: Sadece sırası gelen parçayı MEMFS'ten oku
         const chunkData = await activeFfmpeg.readFile(chunkName);
         const rawUint8 = chunkData as Uint8Array;
         const copyBuffer = new ArrayBuffer(rawUint8.byteLength);
         const chunkUint8 = new Uint8Array(copyBuffer);
         chunkUint8.set(rawUint8);
 
-        // Video dosyası yüklendiyse (küçük 32kbps MP3 parçaları) oynatıcı/indirme için sakla;
+        // Video dosyası yüklendiyse (küçük 48kbps MP3 parçaları) oynatıcı/indirme için sakla;
         // Doğrudan ses dosyası yüklendiyse ekstra RAM harcamamak için saklama!
         if (!isDirectAudioFile) {
           videoAudioBuffers[chunkIndex] = chunkUint8;
@@ -590,7 +646,12 @@ export default function VideoToSubtitlePage() {
           error?: string;
           text?: string;
           duration?: number;
-          segments?: Array<{ start: number; end: number; text: string }>;
+          segments?: Array<{
+            start: number;
+            end: number;
+            text: string;
+            no_speech_prob?: number;
+          }>;
         } | null = null;
 
         const maxAttempts = 3;
@@ -600,6 +661,9 @@ export default function VideoToSubtitlePage() {
               const formData = new FormData();
               formData.append("file", chunkFile);
               formData.append("language", language);
+              if (previousContext) {
+                formData.append("previousContext", previousContext);
+              }
 
               const response = await fetch("/api/transcribe", {
                 method: "POST",
@@ -611,7 +675,12 @@ export default function VideoToSubtitlePage() {
                 error?: string;
                 text?: string;
                 duration?: number;
-                segments?: Array<{ start: number; end: number; text: string }>;
+                segments?: Array<{
+                  start: number;
+                  end: number;
+                  text: string;
+                  no_speech_prob?: number;
+                }>;
               };
 
               try {
@@ -655,7 +724,7 @@ export default function VideoToSubtitlePage() {
             }
           }
         } finally {
-          // 3. Anlık Bellek Temizliği (Streaming Garbage Collection):
+          // Anlık Bellek Temizliği (Streaming Garbage Collection):
           // /api/transcribe isteği tamamlandığı anda bir sonraki parçaya geçmeden hemen önce RAM'den sil!
           try {
             await activeFfmpeg.deleteFile(chunkName);
@@ -673,69 +742,56 @@ export default function VideoToSubtitlePage() {
         completedChunksCount += 1;
         setCurrentChunkIndex(completedChunksCount);
 
-        // 1. Dinamik Zaman Senkronizasyonu: (chunkIndex * segmentTime)
-        const timeOffsetSeconds = chunkIndex * segmentTime;
-        const chunkSegments: Array<{ start: number; end: number; text: string }> =
-          [];
+        const chunkDuration =
+          typeof result.duration === "number" && result.duration > 0
+            ? result.duration
+            : segmentTime;
+
+        const validChunkTexts: string[] = [];
 
         if (Array.isArray(result.segments) && result.segments.length > 0) {
           for (const seg of result.segments) {
-            chunkSegments.push({
-              start: Number(seg.start) + timeOffsetSeconds,
-              end: Number(seg.end) + timeOffsetSeconds,
-              text: String(seg.text || "").trim(),
-            });
-          }
-        } else if (result.text && String(result.text).trim().length > 0) {
-          chunkSegments.push({
-            start: timeOffsetSeconds,
-            end:
-              timeOffsetSeconds +
-              (Number(result.duration) || segmentTime),
-            text: String(result.text).trim(),
-          });
-        }
-
-        return chunkSegments;
-      };
-
-      // Paralel Transkripsiyon: 2'şerli gruplar (concurrency = 2) halinde Promise.all ile gönder
-      for (
-        let batchStart = 0;
-        batchStart < chunkFileNames.length;
-        batchStart += TRANSCRIPTION_CONCURRENCY
-      ) {
-        const batchIndices: number[] = [];
-        for (
-          let offset = 0;
-          offset < TRANSCRIPTION_CONCURRENCY &&
-          batchStart + offset < chunkFileNames.length;
-          offset++
-        ) {
-          batchIndices.push(batchStart + offset);
-        }
-
-        const batchLabel = batchIndices
-          .map((idx) => `${idx + 1}`)
-          .join(" ve ");
-        setRetryWarning(null);
-        setStatusLog(
-          `Parça ${batchLabel} / ${chunkFileNames.length} paralel olarak Groq Whisper Large V3 Turbo ile işleniyor...`
-        );
-
-        const batchResults = await Promise.all(
-          batchIndices.map((idx) => transcribeSingleChunk(idx))
-        );
-
-        for (const chunkSegs of batchResults) {
-          for (const seg of chunkSegs) {
+            if (isHallucinatedSegment(seg)) {
+              continue;
+            }
+            const cleanText = String(seg.text || "").trim();
             allSyncedSegments.push({
               id: allSyncedSegments.length + 1,
-              start: seg.start,
-              end: seg.end,
-              text: seg.text,
+              start: Number(seg.start) + cumulativeOffset,
+              end: Number(seg.end) + cumulativeOffset,
+              text: cleanText,
             });
+            validChunkTexts.push(cleanText);
           }
+        } else if (
+          result.text &&
+          !isHallucinatedSegment({ text: result.text })
+        ) {
+          const cleanText = String(result.text).trim();
+          allSyncedSegments.push({
+            id: allSyncedSegments.length + 1,
+            start: cumulativeOffset,
+            end: cumulativeOffset + chunkDuration,
+            text: cleanText,
+          });
+          validChunkTexts.push(cleanText);
+        }
+
+        // Bir sonraki parçaya geçmeden önce gerçek ses süresini (response.duration) cumulativeOffset'e ekle
+        cumulativeOffset += chunkDuration;
+
+        // Bir önceki parçanın son cümlesini bir sonraki parçanın API isteğine previousContext olarak aktar
+        if (validChunkTexts.length > 0) {
+          const fullChunkText = validChunkTexts.join(" ").trim();
+          const sentences = fullChunkText
+            .split(/(?<=[.!?…])\s+/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+          const lastSentence =
+            sentences.length > 0
+              ? sentences[sentences.length - 1]
+              : validChunkTexts[validChunkTexts.length - 1];
+          previousContext = lastSentence.slice(-220);
         }
 
         const partialSrt = generateSrtContent(allSyncedSegments);
@@ -873,7 +929,7 @@ export default function VideoToSubtitlePage() {
       id: 2,
       title: "5 GB Video Diskten Okunuyor ve Ses Ayıklanıyor",
       description:
-        "WORKERFS + Tek Geçişli (Single-Pass) 12kHz Mono 32kbps MP3 (~1.1 MB / 5 dk)",
+        "WORKERFS + Tek Geçişli (Single-Pass) 16kHz Mono 48kbps MP3 (~1.7 MB / 5 dk)",
       icon: HardDriveDownload,
     },
     {
@@ -881,8 +937,8 @@ export default function VideoToSubtitlePage() {
       title: "Ses Parçaları Yapay Zeka ile Altyazıya Dönüştürülüyor",
       description:
         totalChunks > 0
-          ? `Parça ${currentChunkIndex} / ${totalChunks} tamamlandı... (2x Paralel Groq Whisper)`
-          : "2'şerli paralel Groq Whisper API ile zaman damgalı segmentler çıkarılıyor",
+          ? `Parça ${currentChunkIndex} / ${totalChunks} tamamlandı... (Groq Whisper Large V3)`
+          : "Groq Whisper Large V3 API ile kesin zaman damgalı ve bağlam korumalı segmentler çıkarılıyor",
       icon: Sparkles,
     },
     {
@@ -1050,7 +1106,7 @@ export default function VideoToSubtitlePage() {
             className="inline-flex items-center gap-2 rounded-full border border-indigo-500/30 bg-indigo-500/10 px-3.5 py-1 text-xs font-medium text-indigo-300"
           >
             <Sparkles className="h-3.5 w-3.5 text-indigo-400" />
-            <span>FFmpeg.wasm WORKERFS + Groq Whisper Large V3 Turbo</span>
+            <span>FFmpeg.wasm WORKERFS + Groq Whisper Large V3</span>
           </motion.div>
           <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white">
             Devasa Videoları RAM Çökmeden{" "}
@@ -1432,7 +1488,7 @@ export default function VideoToSubtitlePage() {
                           </span>
                         </div>
                         <p className="text-xs text-zinc-400 mt-0.5">
-                          12kHz • Mono • 32kbps ultra-hızlı (Single-Pass) MP3 ses akışı
+                          16kHz • Mono • 48kbps yüksek netlikli (Single-Pass) MP3 ses akışı
                         </p>
                       </div>
                     </div>

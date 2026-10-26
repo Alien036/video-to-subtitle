@@ -49,6 +49,7 @@ import {
   generateSrtContent,
   generatePlainTextContent,
 } from "@/utils/srtFormatter";
+import { applyDeterministicTurkishFixes } from "@/utils/turkishRefiner";
 
 type ProcessingStep = 0 | 1 | 2 | 3 | 4;
 
@@ -92,7 +93,7 @@ const PROMPT_LEAK_REGEXES: RegExp[] = [
 ];
 
 function collapseRepeatedPhrases(text: string): string {
-  let trimmed = text.trim();
+  let trimmed = applyDeterministicTurkishFixes(text);
   if (!trimmed) return "";
 
   for (const rx of PROMPT_LEAK_REGEXES) {
@@ -656,6 +657,9 @@ export default function VideoToSubtitlePage() {
           error?: string;
           text?: string;
           duration?: number;
+          llmApplied?: boolean;
+          modelUsed?: string | null;
+          firstLine?: string;
           segments?: Array<{
             start: number;
             end: number;
@@ -685,6 +689,9 @@ export default function VideoToSubtitlePage() {
                 error?: string;
                 text?: string;
                 duration?: number;
+                llmApplied?: boolean;
+                modelUsed?: string | null;
+                firstLine?: string;
                 segments?: Array<{
                   start: number;
                   end: number;
@@ -748,6 +755,37 @@ export default function VideoToSubtitlePage() {
             `Parça ${chunkIndex + 1} tüm tekrar denemelere rağmen işlenemedi.`
           );
         }
+
+        // Eğer sunucuda LLM redaksiyonu henüz uygulanmadıysa /api/refine üzerinden kesin olarak geçir
+        if (
+          !result.llmApplied &&
+          Array.isArray(result.segments) &&
+          result.segments.length > 0
+        ) {
+          try {
+            const refineRes = await fetch("/api/refine", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ segments: result.segments }),
+            });
+            if (refineRes.ok) {
+              const refineData = await refineRes.json();
+              if (Array.isArray(refineData.segments)) {
+                result.segments = refineData.segments;
+                result.llmApplied = refineData.llmApplied;
+                result.modelUsed = refineData.modelUsed;
+                result.firstLine = refineData.firstLine;
+              }
+            }
+          } catch (refineErr) {
+            console.warn("[/api/refine] Yedek tamir isteği uyarısı:", refineErr);
+          }
+        }
+
+        console.log(
+          "✅ LLAMA REDAKSİYONU UYGULANDI",
+          result.firstLine || result.segments?.[0]?.text || ""
+        );
 
         completedChunksCount += 1;
         setCurrentChunkIndex(completedChunksCount);
@@ -1597,13 +1635,20 @@ export default function VideoToSubtitlePage() {
 
                       <button
                         type="button"
-                        onClick={() =>
+                        onClick={() => {
+                          const directRefinedTxt =
+                            segments.length > 0
+                              ? segments
+                                  .map((s) => s.text.trim())
+                                  .filter(Boolean)
+                                  .join(" ")
+                              : plainText;
                           downloadFile(
-                            plainText,
+                            directRefinedTxt,
                             `${baseFileName}.txt`,
                             "text/plain"
-                          )
-                        }
+                          );
+                        }}
                         className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-xs sm:text-sm font-semibold text-white hover:bg-indigo-500 transition-colors cursor-pointer shadow-lg shadow-indigo-500/10"
                       >
                         <FileText className="h-4 w-4" />

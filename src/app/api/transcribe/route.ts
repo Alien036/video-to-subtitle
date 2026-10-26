@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import Groq from "groq-sdk";
+import {
+  applyDeterministicTurkishFixes,
+  refineSegmentsWithLLM,
+  stripPromptLeakage,
+} from "@/utils/turkishRefiner";
 
 export const maxDuration = 60;
 
@@ -29,23 +34,6 @@ let roundRobinCounter = Math.floor(Math.random() * 1000);
 
 const basePrompt =
   "Merhaba, hoş geldiniz. Nasılsınız, görüşmeler nasıl gidiyor? Kendinizden ve yaşadığınız duygulardan biraz bahseder misiniz?";
-
-const PROMPT_LEAK_REGEXES: RegExp[] = [
-  /merhaba,?\s*hoş\s*geldiniz\.?/gi,
-  /nasılsınız,?\s*görüşmeler\s*nasıl\s*gidiyor\??/gi,
-  /kendinizden\s+ve\s+yaşadığınız\s+duygulardan\s+biraz\s+bahseder\s+misiniz\??/gi,
-  /noktalama\s+işaretleri(ne)?(\s+ve\s+türkçe\s+imla\s+kurallarına(\s+dikkat\s+et|\s+uygun\s+metin))?\.?/gi,
-  /doğal\s+türkçe\s+konuşma\s+ve\s+seans\s+kaydı\.?/gi,
-  /bu\s+bir\s+türkçe\s+konuşma\s+kaydıdır\.?/gi,
-];
-
-export function stripPromptLeakage(text: string): string {
-  let cleaned = text;
-  for (const rx of PROMPT_LEAK_REGEXES) {
-    cleaned = cleaned.replace(rx, " ");
-  }
-  return cleaned.replace(/\s{2,}/g, " ").trim();
-}
 
 const HALLUCINATION_PATTERNS: RegExp[] = [
   /altyazı\s*m\.?\s*k\.?/i,
@@ -304,7 +292,9 @@ export async function POST(request: NextRequest) {
           if (Array.isArray(transcription.segments)) {
             for (let idx = 0; idx < transcription.segments.length; idx++) {
               const seg = transcription.segments[idx];
-              const withoutPromptLeak = stripPromptLeakage(seg.text ?? "");
+              const withoutPromptLeak = applyDeterministicTurkishFixes(
+                seg.text ?? ""
+              );
               const cleanedText = collapseRepeatedPhrases(withoutPromptLeak);
               if (!cleanedText) continue;
 
@@ -340,73 +330,23 @@ export async function POST(request: NextRequest) {
             }
           }
 
-          // 3. Llama-3.3-70B Tamiri: Tek İstek (Single Call) + Multi-Key Failover Mimarisi
-          if (filteredSegments.length > 0) {
-            const numberedInput = filteredSegments
-              .map((s, idx) => `[${idx}] ${s.text.trim()}`)
-              .join("\n");
-            const startKeyIndex = keyIndex;
-            let llmSuccess = false;
+          // 3. Bozuk Heceleri ve Yanlış Duyulmuş Kelimeleri Groq LLM (Tek İstek + Multi-Key Failover) ile Tamir Et
+          const refineResult = await refineSegmentsWithLLM(
+            filteredSegments,
+            keys,
+            keyIndex
+          );
 
-            for (let k = 0; k < keys.length; k++) {
-              const llmKey = keys[(startKeyIndex + 1 + k) % keys.length];
-              const llmGroq = new Groq({ apiKey: llmKey });
-              try {
-                const completion = await llmGroq.chat.completions.create({
-                  model: "llama-3.3-70b-versatile",
-                  temperature: 0.1,
-                  max_tokens: 8000,
-                  messages: [
-                    {
-                      role: "system",
-                      content: `Sen uzman bir Türkçe psikolojik danışmanlık deşifre redaktörüsün. Sana numaralı satırlar halinde ses tanıma (Whisper) çıktısı verilecek.
-GÖREVİN:
-1. Ses boğukluğundan dolayı tek/iki harf olarak yarım çıkmış TÜM kopuk heceleri cümlenin gelişine göre tamir et (Örn: "Peki hayat bu t a insanlar m Arkada m" -> "Peki hayatında tam insanlar mı, arkadaşların mı?", "Tabii can biraz yedirece i b vicdan k oldu" -> "Tabii canım biraz yanacağı için böyle vicdanım kötü oldu", "Yazarken de m olmad da biliyorum do olarak" -> "Yazarken de mükemmel olmadığımı da biliyorum doğal olarak", "Bir oldu s s a ya" -> "Bir şey olduğunu söyle söyle açtım ya").
-2. Sesten yanlış duyulmuş anlamsız kelimeleri psikolojik seans bağlamına göre düzelt (Örn: "siz de de ölürsünüz" -> "siz de görürsünüz", "eğri dolar gibi şey değil" -> "elimde olan bir şey değil").
-3. Satır numaralarını ([0], [1], ...) KESİNLİKLE koru ve her satırı "[numara] düzeltilmiş metin" formatında döndür. Hiçbir satırı atlama ve ekstra açıklama yazma!`,
-                    },
-                    { role: "user", content: numberedInput },
-                  ],
-                });
-
-                const output = completion.choices[0]?.message?.content || "";
-                const lines = output.split("\n");
-                for (const line of lines) {
-                  const match = line.trim().match(/^\[(\d+)\]\s*(.+)$/);
-                  if (match) {
-                    const idx = parseInt(match[1], 10);
-                    if (filteredSegments[idx]) {
-                      const repaired = stripPromptLeakage(match[2].trim());
-                      if (repaired) {
-                        filteredSegments[idx].text = repaired;
-                      }
-                    }
-                  }
-                }
-                llmSuccess = true;
-                break; // Başarılı olduysa döngüden çık
-              } catch (err) {
-                console.warn(
-                  `Llama key ${k} hatası, sıradaki key deneniyor...`,
-                  err
-                );
-              }
-            }
-
-            if (!llmSuccess) {
-              console.warn(
-                "[/api/transcribe] Tüm anahtarlarla Llama-3.3 redaksiyonu denendi ancak başarısız oldu; temizlenmiş Whisper metni kullanılıyor."
-              );
-            }
-          }
-
-          const cleanFullText = filteredSegments
+          const cleanFullText = refineResult.segments
             .map((s) => s.text.trim())
             .join(" ");
 
           return NextResponse.json({
-            segments: filteredSegments,
+            segments: refineResult.segments,
             text: cleanFullText,
+            llmApplied: refineResult.llmApplied,
+            modelUsed: refineResult.modelUsed,
+            firstLine: refineResult.firstLine,
             language: transcription.language ?? language,
             duration: Number(transcription.duration) || 0,
           });

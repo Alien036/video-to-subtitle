@@ -54,6 +54,11 @@ const HALLUCINATION_PATTERNS: RegExp[] = [
   /^teşekkürler\.?$/i,
   /^teşekkür\s+ederim\.?$/i,
   /^iyi\s+seyirler\.?$/i,
+  /müzik\s+dinle/i,
+  /müzik\s+çal/i,
+  /^müzik\.?$/i,
+  /şarkı\s+söz/i,
+  /^enstrümantal\.?$/i,
 ];
 
 export function normalizeForComparison(text: string): string {
@@ -125,8 +130,14 @@ export function isHallucinatedSegment(
     return true;
   }
 
-  // 3. Model tamamen düşük güvenle uyduruyorsa filtrele
+  // 3. Model tamamen düşük güvenle uyduruyorsa veya şarkı nakaratı kısır döngüsündeyse filtrele
   if (typeof seg.avg_logprob === "number" && seg.avg_logprob < -1.35) {
+    return true;
+  }
+  if (
+    typeof seg.compression_ratio === "number" &&
+    seg.compression_ratio > 2.2
+  ) {
     return true;
   }
 
@@ -136,7 +147,7 @@ export function isHallucinatedSegment(
   }
 
   // Sadece noktalama işareti, üç nokta veya müzik sembollerinden oluşuyorsa filtrele
-  if (/^[\s.…♪♫\-_*,!?;:()[\]"']+$/u.test(rawText)) {
+  if (/^[\s.…♪♫♬♩\-_*,!?;:()[\]"']+$/u.test(rawText)) {
     return true;
   }
 
@@ -149,7 +160,7 @@ export function isHallucinatedSegment(
     return true;
   }
 
-  // Türkçe harf duyarlı (toLocaleLowerCase('tr')) kesin halüsinasyon kontrolleri
+  // Türkçe harf duyarlı (toLocaleLowerCase('tr')) kesin halüsinasyon ve fon müziği kontrolleri
   if (
     lower.includes("izlediğiniz için") ||
     lower.includes("dinlediğiniz için") ||
@@ -158,6 +169,9 @@ export function isHallucinatedSegment(
     lower.includes("altyazı") ||
     lower.includes("altyazi") ||
     lower.includes("noktalama işaretleri") ||
+    lower.includes("müzik dinleyin") ||
+    lower.includes("müzik çalıyor") ||
+    lower.includes("şarkı sözleri") ||
     lower.includes("amara.org") ||
     lower.includes("subtitles by")
   ) {

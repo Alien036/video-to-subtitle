@@ -74,6 +74,11 @@ const HALLUCINATION_PATTERNS: RegExp[] = [
   /^teşekkürler\.?$/i,
   /^teşekkür\s+ederim\.?$/i,
   /^iyi\s+seyirler\.?$/i,
+  /müzik\s+dinle/i,
+  /müzik\s+çal/i,
+  /^müzik\.?$/i,
+  /şarkı\s+söz/i,
+  /^enstrümantal\.?$/i,
 ];
 
 function normalizeForComparison(text: string): string {
@@ -167,6 +172,9 @@ function isHallucinatedSegment(
     lower.includes("altyazı") ||
     lower.includes("altyazi") ||
     lower.includes("noktalama işaretleri") ||
+    lower.includes("müzik dinleyin") ||
+    lower.includes("müzik çalıyor") ||
+    lower.includes("şarkı sözleri") ||
     lower.includes("amara.org") ||
     lower.includes("subtitles by")
   ) {
@@ -556,7 +564,7 @@ export default function VideoToSubtitlePage() {
 
       const segmentTime = CHUNK_DURATION_SECONDS; // 240 sn (4 dakika)
       setStatusLog(
-        "Ses netleştirme filtresi (highpass + dynaudnorm) aktif: 16kHz Mono 64kbps MP3 parçaları (~1.9 MB / 4 dk) üretiliyor..."
+        "İnsan sesi izolasyonu ve fon müziği bastırma (120Hz-4000Hz Vocal Band + afftdn + dynaudnorm) aktif: 16kHz Mono 64kbps MP3 parçaları (~1.9 MB / 4 dk) üretiliyor..."
       );
 
       const exitCode = await activeFfmpeg.exec([
@@ -570,11 +578,12 @@ export default function VideoToSubtitlePage() {
         "1",
         "-ar",
         "16000", // KESİNLİKLE 16kHz (Kelime yutulmasını önler!)
-        // SES NETLEŞTİRME FİLTRESİ:
-        // highpass=f=85 -> Oda uğultusunu ve dip gürültüyü keser
-        // dynaudnorm -> Kısık sesle/uzaktan konuşan kişinin sesini otomatik yükseltir ve dengeler!
+        // İNSAN SESİ İZOLASYONU VE FON MÜZİĞİ BASTIRMA FİLTRESİ:
+        // highpass=f=120,lowpass=f=4000 -> Fon müziğinin bas ve tiz enstrümanlarını kesip Vocal Band (120Hz - 4000Hz) aralığını öne çıkarır
+        // afftdn=nf=-25 -> Arka plan müziğini ve gürültüyü FFT ile sönümler
+        // dynaudnorm=f=150:g=15 -> Kısık sesle/uzaktan konuşan kişinin sesini otomatik yükseltir ve dengeler!
         "-af",
-        "highpass=f=85,dynaudnorm=f=150:g=15",
+        "highpass=f=120,lowpass=f=4000,afftdn=nf=-25,dynaudnorm=f=150:g=15",
         "-c:a",
         "libmp3lame",
         "-b:a",

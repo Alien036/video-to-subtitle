@@ -76,7 +76,7 @@ const HALLUCINATION_PATTERNS: RegExp[] = [
 
 function normalizeForComparison(text: string): string {
   return text
-    .toLowerCase()
+    .toLocaleLowerCase("tr")
     .replace(/[.,!?;:…"''"()[\]\-_♪♫\s]+/g, " ")
     .trim();
 }
@@ -128,10 +128,13 @@ function collapseRepeatedPhrases(text: string): string {
   return result.trim();
 }
 
-function isHallucinatedSegment(seg: {
-  text?: string;
-  no_speech_prob?: number;
-}): boolean {
+function isHallucinatedSegment(
+  seg: {
+    text?: string;
+    no_speech_prob?: number;
+  },
+  segmentIndex = 0
+): boolean {
   if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.5) {
     return true;
   }
@@ -145,11 +148,33 @@ function isHallucinatedSegment(seg: {
     return true;
   }
 
-  const normalized = rawText
+  const lower = rawText.toLocaleLowerCase("tr").trim();
+  const normalized = lower
     .replace(/^[.…\s,-]+|[.…\s!-]+$/g, "")
     .trim();
 
   if (!normalized || normalized.length < 2) {
+    return true;
+  }
+
+  if (
+    lower.includes("izlediğiniz için") ||
+    lower.includes("dinlediğiniz için") ||
+    lower.includes("abone ol") ||
+    lower.includes("abonem") ||
+    lower.includes("altyazı") ||
+    lower.includes("altyazi") ||
+    lower.includes("noktalama işaretleri") ||
+    lower.includes("amara.org") ||
+    lower.includes("subtitles by")
+  ) {
+    return true;
+  }
+
+  if (
+    segmentIndex < 2 &&
+    (lower.includes("teşekkür ederim") || lower.includes("teşekkürler"))
+  ) {
     return true;
   }
 
@@ -733,16 +758,20 @@ export default function VideoToSubtitlePage() {
 
         const validChunkTexts: string[] = [];
 
-        if (Array.isArray(result.segments) && result.segments.length > 0) {
-          for (const seg of result.segments) {
+        if (Array.isArray(result.segments)) {
+          for (let sIdx = 0; sIdx < result.segments.length; sIdx++) {
+            const seg = result.segments[sIdx];
             const cleanText = collapseRepeatedPhrases(String(seg.text || ""));
             if (!cleanText) continue;
 
             if (
-              isHallucinatedSegment({
-                text: cleanText,
-                no_speech_prob: seg.no_speech_prob,
-              })
+              isHallucinatedSegment(
+                {
+                  text: cleanText,
+                  no_speech_prob: seg.no_speech_prob,
+                },
+                sIdx
+              )
             ) {
               continue;
             }
@@ -757,24 +786,6 @@ export default function VideoToSubtitlePage() {
               id: allSyncedSegments.length + 1,
               start: Number(seg.start) + cumulativeOffset,
               end: Number(seg.end) + cumulativeOffset,
-              text: cleanText,
-            });
-            validChunkTexts.push(cleanText);
-          }
-        } else if (result.text) {
-          const cleanText = collapseRepeatedPhrases(String(result.text));
-          const currentNorm = normalizeForComparison(cleanText);
-          if (
-            cleanText &&
-            currentNorm &&
-            currentNorm !== lastAddedSegmentNorm &&
-            !isHallucinatedSegment({ text: cleanText })
-          ) {
-            lastAddedSegmentNorm = currentNorm;
-            allSyncedSegments.push({
-              id: allSyncedSegments.length + 1,
-              start: cumulativeOffset,
-              end: cumulativeOffset + chunkDuration,
               text: cleanText,
             });
             validChunkTexts.push(cleanText);

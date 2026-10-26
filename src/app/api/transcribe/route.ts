@@ -70,7 +70,7 @@ const HALLUCINATION_PATTERNS: RegExp[] = [
 
 export function normalizeForComparison(text: string): string {
   return text
-    .toLowerCase()
+    .toLocaleLowerCase("tr")
     .replace(/[.,!?;:…"''"()[\]\-_♪♫\s]+/g, " ")
     .trim();
 }
@@ -113,12 +113,15 @@ export function collapseRepeatedPhrases(text: string): string {
   return result.trim();
 }
 
-export function isHallucinatedSegment(seg: {
-  text?: string;
-  no_speech_prob?: number;
-  avg_logprob?: number;
-  compression_ratio?: number;
-}): boolean {
+export function isHallucinatedSegment(
+  seg: {
+    text?: string;
+    no_speech_prob?: number;
+    avg_logprob?: number;
+    compression_ratio?: number;
+  },
+  segmentIndex = 0
+): boolean {
   // 1. Sessizlik olasılığı yüksekse filtrele
   if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.5) {
     return true;
@@ -149,11 +152,34 @@ export function isHallucinatedSegment(seg: {
     return true;
   }
 
-  const normalized = rawText
+  const lower = rawText.toLocaleLowerCase("tr").trim();
+  const normalized = lower
     .replace(/^[.…\s,-]+|[.…\s!-]+$/g, "")
     .trim();
 
   if (!normalized || normalized.length < 2) {
+    return true;
+  }
+
+  // Türkçe harf duyarlı (toLocaleLowerCase('tr')) kesin halüsinasyon kontrolleri
+  if (
+    lower.includes("izlediğiniz için") ||
+    lower.includes("dinlediğiniz için") ||
+    lower.includes("abone ol") ||
+    lower.includes("abonem") ||
+    lower.includes("altyazı") ||
+    lower.includes("altyazi") ||
+    lower.includes("noktalama işaretleri") ||
+    lower.includes("amara.org") ||
+    lower.includes("subtitles by")
+  ) {
+    return true;
+  }
+
+  if (
+    segmentIndex < 2 &&
+    (lower.includes("teşekkür ederim") || lower.includes("teşekkürler"))
+  ) {
     return true;
   }
 
@@ -283,10 +309,13 @@ export async function POST(request: NextRequest) {
               if (!cleanedText) continue;
 
               if (
-                isHallucinatedSegment({
-                  ...seg,
-                  text: cleanedText,
-                })
+                isHallucinatedSegment(
+                  {
+                    ...seg,
+                    text: cleanedText,
+                  },
+                  idx
+                )
               ) {
                 continue;
               }
@@ -311,54 +340,53 @@ export async function POST(request: NextRequest) {
             }
           }
 
-          // Segment metinlerini birleştirip Llama-3.3-70b ile bozuk heceleri onar
-          if (filteredSegments.length > 0) {
+          // 3. Llama-3.3-70B Tamirini 25'erli Gruplar Halinde ve Kesin Çalışacak Şekilde Yap
+          const BATCH_SIZE = 25;
+          for (let i = 0; i < filteredSegments.length; i += BATCH_SIZE) {
+            const batch = filteredSegments.slice(i, i + BATCH_SIZE);
+            const numberedLines = batch
+              .map((s, idx) => `[${i + idx}] ${s.text.trim()}`)
+              .join("\n");
             try {
-              const numberedLines = filteredSegments
-                .map((s, idx) => `[${idx}] ${s.text.trim()}`)
-                .join("\n");
               const completion = await groq.chat.completions.create({
                 model: "llama-3.3-70b-versatile",
                 temperature: 0.1,
+                max_tokens: 4096,
                 messages: [
                   {
                     role: "system",
-                    content: `Sen uzman bir Türkçe deşifre ve altyazı redaktörüsün. Sana bir psikolojik danışmanlık seansının ses tanımasından (STT) çıkmış numaralı altyazı satırları verilecek.
-GÖREVİN:
-1. Sesten dolayı yarım kalmış, harfleri kopmuş kelimeleri (Örn: "Peki hayat t a m insanlar m Arkada var m" -> "Peki hayatında tam insanlar mı, arkadaşların var mı?", "Asl anlatay" -> "Aslında anlatayım", "Can biraz yetece i b vicdan k oldu" -> "Canım biraz yanacağı için böyle vicdanım kötü oldu") bağlama uygun şekilde tamir et.
-2. Konuşmanın doğal akışını, samimiyetini ve cümle sayısını ASLA değiştirme, özetleme yapma!
-3. Sadece düzeltilmiş satırları aynı "[0] metin" formatında alt alta döndür, başka hiçbir açıklama yazma.`,
+                    content: `Sen uzman bir Türkçe deşifre redaktörüsün. Aşağıdaki numaralı satırlarda ses boğukluğundan dolayı yarım çıkmış tek harfli kopuklukları (Örn: "hayat bu t a insanlar m Arkada m" -> "hayatında tam insanlar mı, arkadaşların mı", "yedirece i b vicdan k oldu" -> "yedireceği için böyle vicdanım kötü oldu", "yazarken de m olmad da biliyorum do olarak" -> "yazarken de mükemmel olmadığımı da biliyorum doğal olarak") bağlama göre tamir et. Ayrıca sesten yanlış duyulmuş anlamsız kelimeleri ("siz de de ölürsünüz" -> "siz de görürsünüz", "eğri dolar gibi" -> "elimde olan bir şey") psikolojik danışmanlık seansı bağlamına uygun düzelt. Sadece "[numara] düzeltilmiş metin" formatında yanıt ver.`,
                   },
                   { role: "user", content: numberedLines },
                 ],
               });
-
-              const correctedText =
-                completion.choices[0]?.message?.content || "";
-              const correctedLines = correctedText.split("\n");
-              for (const line of correctedLines) {
-                const match = line.match(/^\[(\d+)\]\s*(.+)$/);
+              const lines = (
+                completion.choices[0]?.message?.content || ""
+              ).split("\n");
+              for (const line of lines) {
+                const match = line.match(/\[(\d+)\]\s*(.+)/);
                 if (match) {
-                  const idx = parseInt(match[1], 10);
-                  if (filteredSegments[idx]) {
+                  const index = parseInt(match[1], 10);
+                  if (filteredSegments[index]) {
                     const repaired = stripPromptLeakage(match[2].trim());
                     if (repaired) {
-                      filteredSegments[idx].text = repaired;
+                      filteredSegments[index].text = repaired;
                     }
                   }
                 }
               }
-            } catch (llmErr) {
-              console.warn(
-                "LLM redaksiyonu atlandı, ham Whisper metni kullanılıyor:",
-                llmErr
-              );
+            } catch (err) {
+              console.error("Llama batch error:", err);
             }
           }
 
+          const cleanFullText = filteredSegments
+            .map((s) => s.text.trim())
+            .join(" ");
+
           return NextResponse.json({
-            text: filteredSegments.map((s) => s.text).join(" ").trim(),
             segments: filteredSegments,
+            text: cleanFullText,
             language: transcription.language ?? language,
             duration: Number(transcription.duration) || 0,
           });

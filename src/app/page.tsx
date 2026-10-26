@@ -89,7 +89,22 @@ function normalizeForComparison(text: string): string {
     .trim();
 }
 
+const ADMIN_EMAILS_LIST = (
+  process.env.NEXT_PUBLIC_ADMIN_EMAIL ||
+  "umutakilli4646@gmail.com,mali190346@gmail.com"
+)
+  .split(",")
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean);
+
+function checkIsAdminUserEmail(email?: string | null): boolean {
+  if (!email) return false;
+  const cleanEmail = email.trim().toLowerCase();
+  return ADMIN_EMAILS_LIST.includes(cleanEmail) || isAdminEmail(cleanEmail);
+}
+
 const PROMPT_LEAK_REGEXES: RegExp[] = [
+  /danışman,\s*danışan,\s*süpervizörüm,\s*yks\s*dönemi,\s*sınav\s*dönemi,\s*balık\s*etli,\s*yurt,\s*kütüphane\.?/gi,
   /merhaba,?\s*hoş\s*geldiniz\.?/gi,
   /nasılsınız,?\s*görüşmeler\s*nasıl\s*gidiyor\??/gi,
   /kendinizden\s+ve\s+yaşadığınız\s+duygulardan\s+biraz\s+bahseder\s+misiniz\??/gi,
@@ -119,7 +134,7 @@ function collapseRepeatedPhrases(text: string): string {
   for (const sentence of sentences) {
     const norm = normalizeForComparison(sentence);
     if (!norm) continue;
-    if (norm === lastNorm) {
+    if (norm === lastNorm && norm.split(" ").length > 3) {
       continue;
     }
     uniqueConsecutiveSentences.push(sentence);
@@ -143,10 +158,7 @@ function isHallucinatedSegment(
   },
   segmentIndex = 0
 ): boolean {
-  if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.85) {
-    return true;
-  }
-
+  // Kısık sesleri silen no_speech_prob ve avg_logprob filtreleri KESİNLİKLE kullanılmaz!
   const rawText = String(seg.text ?? "").trim();
   if (!rawText) {
     return true;
@@ -161,7 +173,7 @@ function isHallucinatedSegment(
     .replace(/^[.…\s,-]+|[.…\s!-]+$/g, "")
     .trim();
 
-  if (!normalized || normalized.length < 2) {
+  if (!normalized || normalized.length < 1) {
     return true;
   }
 
@@ -170,8 +182,8 @@ function isHallucinatedSegment(
     lower.includes("dinlediğiniz için") ||
     lower.includes("abone ol") ||
     lower.includes("abonem") ||
-    lower.includes("altyazı") ||
-    lower.includes("altyazi") ||
+    lower.includes("altyazı m.k") ||
+    lower.includes("altyazi m.k") ||
     lower.includes("noktalama işaretleri") ||
     lower.includes("müzik dinleyin") ||
     lower.includes("müzik çalıyor") ||
@@ -183,8 +195,8 @@ function isHallucinatedSegment(
   }
 
   if (
-    segmentIndex < 2 &&
-    (lower.includes("teşekkür ederim") || lower.includes("teşekkürler"))
+    segmentIndex === 0 &&
+    (normalized === "altyazı" || normalized === "çeviri")
   ) {
     return true;
   }
@@ -289,7 +301,9 @@ export default function VideoToSubtitlePage() {
       try {
         const profile = await getUserProfile(user.uid, user.email);
         if (profile) {
-          const adminByEmail = isAdminEmail(user.email || profile.email);
+          const adminByEmail = checkIsAdminUserEmail(
+            user.email || profile.email
+          );
           if (
             adminByEmail &&
             (profile.role !== "admin" ||
@@ -338,7 +352,7 @@ export default function VideoToSubtitlePage() {
         if (snap.exists()) {
           const data = snap.data() as UserProfile;
           const adminFlag =
-            isAdminEmail(data.email || firebaseUser.email) ||
+            checkIsAdminUserEmail(data.email || firebaseUser.email) ||
             data.role === "admin" ||
             Boolean(data.isAdmin);
 
@@ -506,7 +520,8 @@ export default function VideoToSubtitlePage() {
     }
 
     const isAdminUser =
-      userProfile.role === "admin" || isAdminEmail(userProfile.email);
+      userProfile.role === "admin" ||
+      checkIsAdminUserEmail(userProfile.email);
     const remainingQuota = Math.max(
       0,
       (userProfile.quotaLimit ?? 5) - (userProfile.quotaUsed || 0)
@@ -926,7 +941,11 @@ export default function VideoToSubtitlePage() {
             }
 
             const currentNorm = normalizeForComparison(cleanText);
-            if (!currentNorm || currentNorm === lastAddedSegmentNorm) {
+            if (
+              !currentNorm ||
+              (currentNorm === lastAddedSegmentNorm &&
+                currentNorm.split(" ").length > 4)
+            ) {
               continue;
             }
 
@@ -1138,7 +1157,8 @@ export default function VideoToSubtitlePage() {
   }
 
   const isUserAdmin =
-    userProfile.role === "admin" || isAdminEmail(userProfile.email);
+    userProfile.role === "admin" ||
+    checkIsAdminUserEmail(userProfile.email);
 
   // 3. Kullanıcı engellenmişse veya gizli doğrulama kodunu henüz girmemişse VerificationView göster
   if (userProfile.isBlocked || (!userProfile.isVerified && !isUserAdmin)) {

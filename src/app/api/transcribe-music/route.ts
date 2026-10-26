@@ -8,7 +8,6 @@ interface WhisperMusicSegment {
   start: number;
   end: number;
   text: string;
-  no_speech_prob?: number;
 }
 
 interface VerboseMusicTranscriptionResponse {
@@ -23,6 +22,8 @@ let roundRobinCounter = Math.floor(Math.random() * 1000);
 
 const MUSIC_BASE_PROMPT =
   "Şarkı sözleri, Türkçe rap, pop, nakarat, kafiyeli vokal kaydı.";
+
+const GEMINI_MODELS_CHAIN = ["gemini-2.5-flash", "gemini-2.0-flash"];
 
 const MUSIC_MODELS_CHAIN = [
   "openai/gpt-oss-120b",
@@ -44,6 +45,25 @@ const YOUTUBE_FAKE_HALLUCINATIONS: RegExp[] = [
 const MUSIC_PROMPT_LEAK_REGEXES: RegExp[] = [
   /şarkı\s+sözleri,?\s*türkçe\s+rap,?\s*pop,?\s*nakarat,?\s*kafiyeli\s+vokal\s+kaydı\.?/gi,
 ];
+
+function formatMMSS(seconds: number): string {
+  const safeSec =
+    Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  const mins = Math.floor(safeSec / 60);
+  const secs = safeSec % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function parseTimestampToSeconds(ts: string): number {
+  const parts = ts.split(":").map((n) => parseInt(n, 10) || 0);
+  if (parts.length === 3) {
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  }
+  if (parts.length === 2) {
+    return parts[0] * 60 + parts[1];
+  }
+  return 0;
+}
 
 function cleanMusicSegmentText(raw: string): string {
   let text = (raw ?? "").trim();
@@ -92,7 +112,14 @@ function isFakeYoutubeHallucination(text: string): boolean {
   return false;
 }
 
-function getApiKeysPool(): string[] {
+function getGeminiApiKeysPool(): string[] {
+  return (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "")
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
+}
+
+function getGroqApiKeysPool(): string[] {
   return (process.env.GROQ_API_KEYS || process.env.GROQ_API_KEY || "")
     .split(",")
     .map((k) => k.trim())
@@ -118,14 +145,63 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function parseGeminiLyricsLines(rawOutput: string): Array<{
+  id: number;
+  start: number;
+  end: number;
+  text: string;
+}> {
+  const lines = rawOutput
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const parsed: Array<{
+    id: number;
+    start: number;
+    end: number;
+    text: string;
+  }> = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const match = line.match(
+      /^(?:\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*)?(.*)$/
+    );
+    if (!match) continue;
+
+    const tsStr = match[1];
+    const contentRaw = cleanMusicSegmentText(match[2] || "");
+    if (!contentRaw || isFakeYoutubeHallucination(contentRaw)) continue;
+
+    const startSec = tsStr ? parseTimestampToSeconds(tsStr) : i * 4;
+    parsed.push({
+      id: parsed.length + 1,
+      start: startSec,
+      end: startSec + 4,
+      text: contentRaw,
+    });
+  }
+
+  for (let i = 0; i < parsed.length - 1; i++) {
+    if (parsed[i + 1].start > parsed[i].start) {
+      parsed[i].end = parsed[i + 1].start;
+    }
+  }
+
+  return parsed;
+}
+
 export async function POST(request: NextRequest) {
   try {
-    const keys = getApiKeysPool();
-    if (keys.length === 0) {
+    const geminiKeys = getGeminiApiKeysPool();
+    const groqKeys = getGroqApiKeysPool();
+
+    if (geminiKeys.length === 0 && groqKeys.length === 0) {
       return NextResponse.json(
         {
           error:
-            "Sunucu yapılandırma hatası: GROQ_API_KEYS veya GROQ_API_KEY ortam değişkeni tanımlanmamış.",
+            "Sunucu yapılandırma hatası: GEMINI_API_KEYS veya GROQ_API_KEYS ortam değişkeni tanımlanmamış.",
         },
         { status: 500 }
       );
@@ -156,8 +232,107 @@ export async function POST(request: NextRequest) {
     const fileArrayBuffer = await uploadedFile.arrayBuffer();
     const fileName = uploadedFile.name || "chunk.mp3";
     const fileType = uploadedFile.type || "audio/mp3";
+    const currentCounter = roundRobinCounter++;
 
-    const startIndex = roundRobinCounter++ % keys.length;
+    // 1. ÖNCE GEMINI MODELLERİNİ DENE (gemini-2.5-flash -> gemini-2.0-flash)
+    if (geminiKeys.length > 0) {
+      const base64Audio = Buffer.from(fileArrayBuffer).toString("base64");
+      const geminiStartIndex = currentCounter % geminiKeys.length;
+
+      for (const geminiModel of GEMINI_MODELS_CHAIN) {
+        for (let offset = 0; offset < geminiKeys.length; offset++) {
+          const keyIndex = (geminiStartIndex + offset) % geminiKeys.length;
+          const apiKey = geminiKeys[keyIndex];
+
+          try {
+            const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`;
+            const geminiResponse = await fetch(geminiUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-goog-api-key": apiKey,
+              },
+              body: JSON.stringify({
+                contents: [
+                  {
+                    parts: [
+                      {
+                        inline_data: {
+                          mime_type: fileType,
+                          data: base64Audio,
+                        },
+                      },
+                      {
+                        text: `Bu müzik/şarkı kaydının sözlerini (lyrics) nakarat tekrarlarını, kafiyeleri ve vokal satırlarını hiç silmeden zaman damgalı olarak çıkar.
+${previousContext ? `Önceki parçanın son satırı: "${previousContext}"` : ""}
+Çıktıyı her satır yeni satırda (\\n\\n) olacak şekilde şu formatta ver:
+[DD:SS] şarkı sözü satırı`,
+                      },
+                    ],
+                  },
+                ],
+                generationConfig: {
+                  temperature: 0.1,
+                },
+              }),
+            });
+
+            if (!geminiResponse.ok) {
+              const errText = await geminiResponse.text();
+              console.warn(
+                `[/api/transcribe-music] Gemini (${geminiModel}) Key #${keyIndex + 1} yetki/API hatası (${geminiResponse.status}): ${errText.slice(0, 160)}`
+              );
+              continue;
+            }
+
+            const geminiData = await geminiResponse.json();
+            const rawText: string =
+              geminiData?.candidates?.[0]?.content?.parts
+                ?.map((p: { text?: string }) => p.text || "")
+                .join("\n")
+                .trim() || "";
+
+            const parsedSegments = parseGeminiLyricsLines(rawText);
+            if (parsedSegments.length > 0) {
+              const formattedLyrics = parsedSegments
+                .map((s) => `[${formatMMSS(s.start)}] ${s.text}`)
+                .join("\n\n");
+
+              return NextResponse.json({
+                segments: parsedSegments,
+                text: formattedLyrics,
+                llmApplied: true,
+                modelUsed: geminiModel,
+                language,
+                duration: 240,
+              });
+            }
+          } catch (geminiErr: unknown) {
+            console.warn(
+              `[/api/transcribe-music] Gemini (${geminiModel}) Key #${keyIndex + 1} bağlantı uyarısı:`,
+              geminiErr
+            );
+          }
+        }
+      }
+
+      console.warn(
+        "[/api/transcribe-music] Gemini modelleri (gemini-2.5-flash / gemini-2.0-flash) yetki hatası verdi. Otomatik olarak GROQ_API_KEYS (whisper-large-v3 + openai/gpt-oss-120b) yedek (fallback) sistemi devreye sokuluyor..."
+      );
+    }
+
+    // 2. KESİN YEDEK (FALLBACK): GROQ_API_KEYS (whisper-large-v3 + openai/gpt-oss-120b)
+    if (groqKeys.length === 0) {
+      return NextResponse.json(
+        {
+          error:
+            "Gemini API yetki hatası verdi ve yedek GROQ_API_KEYS tanımlanmamış.",
+        },
+        { status: 500 }
+      );
+    }
+
+    const startIndex = currentCounter % groqKeys.length;
     let lastError: unknown = null;
     const maxPoolPasses = 2;
 
@@ -166,9 +341,9 @@ export async function POST(request: NextRequest) {
         await sleep(3000);
       }
 
-      for (let offset = 0; offset < keys.length; offset++) {
-        const keyIndex = (startIndex + offset) % keys.length;
-        const activeApiKey = keys[keyIndex];
+      for (let offset = 0; offset < groqKeys.length; offset++) {
+        const keyIndex = (startIndex + offset) % groqKeys.length;
+        const activeApiKey = groqKeys[keyIndex];
 
         try {
           const groq = new Groq({ apiKey: activeApiKey });
@@ -176,7 +351,7 @@ export async function POST(request: NextRequest) {
             type: fileType,
           });
 
-          // Şarkı & Müzik Modu Whisper Ayarları (no_speech_prob veya nakarat tekrarı silinmez!)
+          // Şarkı & Müzik Modu Whisper Ayarları (no_speech_prob, avg_logprob veya nakarat tekrarı KESİNLİKLE silinmez!)
           const transcription = (await groq.audio.transcriptions.create({
             file: audioFile,
             model: "whisper-large-v3",
@@ -210,15 +385,17 @@ export async function POST(request: NextRequest) {
             }
           }
 
-          // Şarkı Sözü & Rap (Lyrics) Uzmanı LLM Redaksiyonu (Nakaratları ve kafiyeleri korur)
+          let activeModelUsed: string | null = null;
+
+          // Şarkı Sözü & Rap (Lyrics) Uzmanı LLM Redaksiyonu (openai/gpt-oss-120b)
           if (segments.length > 0) {
             const numberedInput = segments
               .map((s, idx) => `[${idx}] ${s.text.trim()}`)
               .join("\n");
 
             outerLoop: for (const modelName of MUSIC_MODELS_CHAIN) {
-              for (let k = 0; k < keys.length; k++) {
-                const llmKey = keys[(keyIndex + 1 + k) % keys.length];
+              for (let k = 0; k < groqKeys.length; k++) {
+                const llmKey = groqKeys[(keyIndex + 1 + k) % groqKeys.length];
                 const llmGroq = new Groq({ apiKey: llmKey });
 
                 try {
@@ -262,6 +439,7 @@ GÖREVİN:
                   }
 
                   if (updatedCount > 0) {
+                    activeModelUsed = modelName;
                     console.log(
                       `🎵 ŞARKI SÖZÜ (LYRICS) REDAKSİYONU UYGULANDI (${modelName}, ${updatedCount}/${segments.length} satır) | İlk Satır: ${segments[0]?.text}`
                     );
@@ -282,11 +460,15 @@ GÖREVİN:
             }
           }
 
-          const cleanFullText = segments.map((s) => s.text.trim()).join(" ");
+          const cleanFullText = segments
+            .map((s) => `[${formatMMSS(s.start)}] ${s.text.trim()}`)
+            .join("\n\n");
 
           return NextResponse.json({
             segments,
             text: cleanFullText,
+            llmApplied: true,
+            modelUsed: activeModelUsed || "openai/gpt-oss-120b",
             language: transcription.language ?? language,
             duration: Number(transcription.duration) || 0,
           });
@@ -294,7 +476,7 @@ GÖREVİN:
           lastError = err;
           const status = getErrorStatus(err);
           console.warn(
-            `[/api/transcribe-music] Key #${keyIndex + 1}/${keys.length} hata verdi (Status: ${status ?? "unknown"}). Sıradaki anahtara geçiliyor...`
+            `[/api/transcribe-music] Groq Key #${keyIndex + 1}/${groqKeys.length} hata verdi (Status: ${status ?? "unknown"}). Sıradaki anahtara geçiliyor...`
           );
           if (status === 400) {
             break;
@@ -308,7 +490,7 @@ GÖREVİN:
     const message =
       lastError instanceof Error
         ? lastError.message
-        : "Groq Whisper API yoğunluğu nedeniyle müzik dosyası şu anda işlenemedi.";
+        : "API yoğunluğu nedeniyle müzik dosyası şu anda işlenemedi.";
 
     return NextResponse.json({ error: message }, { status });
   } catch (error: unknown) {

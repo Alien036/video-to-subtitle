@@ -70,6 +70,7 @@ export function formatDialogueTime(seconds: number): string {
 
 /**
  * Tüm altyazı segmentlerini zaman damgalı diyalog formatında (.txt) okunaklı satırlara dönüştürür.
+ * Çıktı formatı: [DD:SS] **Danışman:** ... / [DD:SS] **Danışan:** ... (her konuşma yeni satırda \n\n ile ayrılır)
  */
 export function generatePlainTextContent(segments: SubtitleSegment[]): string {
   if (!Array.isArray(segments) || segments.length === 0) {
@@ -80,11 +81,11 @@ export function generatePlainTextContent(segments: SubtitleSegment[]): string {
     .filter((segment) => segment.text && segment.text.trim().length > 0)
     .map((segment) => {
       const startStr = formatDialogueTime(segment.start);
-      const endStr = formatDialogueTime(
-        segment.end > segment.start ? segment.end : segment.start + 1
-      );
-      const cleanText = segment.text.trim().replace(/\s+/g, " ");
-      return `[${startStr} - ${endStr}] ${cleanText}`;
+      const cleanText = segment.text
+        .trim()
+        .replace(/^\[\d{1,2}:\d{2}(?::\d{2})?\]\s*/, "")
+        .replace(/\s+/g, " ");
+      return `[${startStr}] ${cleanText}`;
     })
-    .join("\n");
+    .join("\n\n");
 }

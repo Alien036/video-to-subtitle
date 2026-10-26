@@ -16,6 +16,7 @@ const ACTIVE_GROQ_LLM_MODELS = [
 ];
 
 const PROMPT_LEAK_REGEXES: RegExp[] = [
+  /danışman,\s*danışan,\s*süpervizörüm,\s*yks\s*dönemi,\s*sınav\s*dönemi,\s*balık\s*etli,\s*yurt,\s*kütüphane\.?/gi,
   /merhaba,?\s*hoş\s*geldiniz\.?/gi,
   /nasılsınız,?\s*görüşmeler\s*nasıl\s*gidiyor\??/gi,
   /kendinizden\s+ve\s+yaşadığınız\s+duygulardan\s+biraz\s+bahseder\s+misiniz\??/gi,
@@ -26,6 +27,47 @@ const PROMPT_LEAK_REGEXES: RegExp[] = [
   /\(\s*(?:müzik|music|alkış|gülüşmeler|şarkı|enstrümantal)\s*\)/gi,
   /[♪♫♬♩]+/g,
 ];
+
+export function ensureCounselingSpeakerLabel(
+  text: string,
+  index: number
+): string {
+  const trimmed = text
+    .trim()
+    .replace(/^\[\d{1,2}:\d{2}(?::\d{2})?\]\s*/, "");
+  if (!trimmed) return "";
+
+  if (/^\*\*(?:Danışman|Danışan):\*\*/i.test(trimmed)) {
+    return trimmed
+      .replace(/^\*\*danışman:\*\*/i, "**Danışman:**")
+      .replace(/^\*\*danışan:\*\*/i, "**Danışan:**");
+  }
+
+  if (/^(?:Danışman|Danışan)\s*:/i.test(trimmed)) {
+    return trimmed
+      .replace(/^danışman\s*:\s*/i, "**Danışman:** ")
+      .replace(/^danışan\s*:\s*/i, "**Danışan:** ");
+  }
+
+  const lower = trimmed.toLocaleLowerCase("tr");
+  const isCounselorCue =
+    lower.includes("hoş geldin") ||
+    lower.includes("nasılsın") ||
+    lower.includes("süpervizör") ||
+    lower.includes("bahseder misin") ||
+    lower.includes("ne hissettin") ||
+    lower.includes("nasıl hissettirdi") ||
+    lower.includes("peki ") ||
+    lower.endsWith("?");
+
+  const label = isCounselorCue
+    ? "**Danışman:**"
+    : index % 2 === 0
+    ? "**Danışman:**"
+    : "**Danışan:**";
+
+  return `${label} ${trimmed}`;
+}
 
 export function stripPromptLeakage(text: string): string {
   let cleaned = text;
@@ -122,6 +164,9 @@ export async function refineSegmentsWithLLM(
   }
 
   if (keys.length === 0) {
+    for (let i = 0; i < segments.length; i++) {
+      segments[i].text = ensureCounselingSpeakerLabel(segments[i].text, i);
+    }
     return {
       segments,
       llmApplied: false,
@@ -150,11 +195,11 @@ export async function refineSegmentsWithLLM(
           messages: [
             {
               role: "system",
-              content: `Sen uzman bir Türkçe psikolojik danışmanlık deşifre redaktörüsün. Sana numaralı satırlar halinde ses tanıma (Whisper) çıktısı verilecek.
+              content: `Sen uzman bir Türkçe psikolojik danışmanlık (PDR) deşifre redaktörüsün. Sana numaralı satırlar halinde ses tanıma (Whisper) çıktısı verilecek.
 GÖREVİN:
-1. Ses boğukluğundan dolayı tek/iki harf olarak yarım çıkmış TÜM kopuk heceleri cümlenin gelişine göre tamir et (Örn: "Peki hayat bu t a insanlar m Arkada m" -> "Peki hayatında tam insanlar mı, arkadaşların mı?", "Tabii can biraz yedirece i b vicdan k oldu" -> "Tabii canım biraz yanacağı için böyle vicdanım kötü oldu", "Yazarken de m olmad da biliyorum do olarak" -> "Yazarken de mükemmel olmadığımı da biliyorum doğal olarak", "Bir oldu s s a ya" -> "Bir şey olduğunu söyle söyle açtım ya").
-2. Sesten yanlış duyulmuş anlamsız kelimeleri psikolojik seans bağlamına göre düzelt (Örn: "siz de de ölürsünüz" -> "siz de görürsünüz", "eğri dolar gibi şey değil" -> "elimde olan bir şey değil").
-3. SIFIR VERİ KAYBI KURALI: Hiçbir satırı silme, birleştirme veya atlama! Satır numaralarını ([0], [1], ...) KESİNLİKLE birebir koru ve her satırı "[numara] düzeltilmiş metin" formatında döndür.`,
+1. Ses boğukluğundan dolayı tek/iki harf olarak yarım çıkmış TÜM kopuk heceleri ve kelimeleri psikolojik danışmanlık terimlerine ("Danışman, danışan, süpervizörüm, YKS dönemi, sınav dönemi, balık etli, yurt, kütüphane") ve cümlenin gelişine göre tamir et.
+2. Her satırın başına konuşmacının rolüne göre **Danışman:** veya **Danışan:** etiketini ekle (soru soran, yönlendiren, empatik yansıtma yapan ve süpervizörden bahseden kişi **Danışman:**; kendi yaşantısını, sınav/YKS dönemini, yurt/kütüphane anılarını ve duygularını anlatan kişi **Danışan:**).
+3. SIFIR VERİ KAYBI KURALI: Hiçbir satırı silme, birleştirme veya atlama! Satır numaralarını ([0], [1], ...) KESİNLİKLE birebir koru ve her satırı "[numara] **Danışman:** düzeltilmiş metin" veya "[numara] **Danışan:** düzeltilmiş metin" formatında döndür.`,
             },
             { role: "user", content: numberedInput },
           ],
@@ -165,7 +210,7 @@ GÖREVİN:
         let updatedCount = 0;
 
         for (const rawLine of lines) {
-          const line = rawLine.trim().replace(/^\*\*|\*\*$/g, "");
+          const line = rawLine.trim();
           const match = line.match(/^\[(\d+)\]:?\s*(.+)$/);
           if (match) {
             const idx = parseInt(match[1], 10);
@@ -176,7 +221,7 @@ GÖREVİN:
               }
               const repaired = applyDeterministicTurkishFixes(rawContent);
               if (repaired) {
-                segments[idx].text = repaired;
+                segments[idx].text = ensureCounselingSpeakerLabel(repaired, idx);
                 updatedCount++;
               }
             }
@@ -206,6 +251,10 @@ GÖREVİN:
         );
       }
     }
+  }
+
+  for (let i = 0; i < segments.length; i++) {
+    segments[i].text = ensureCounselingSpeakerLabel(segments[i].text, i);
   }
 
   return {

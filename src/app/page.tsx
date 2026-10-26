@@ -812,41 +812,26 @@ export default function VideoToSubtitlePage() {
               try {
                 parsedResult = JSON.parse(responseText);
               } catch {
+                console.error("Gemini API Ham Hata Yanıtı:", responseText);
                 throw new Error(
-                  `Sunucu geçersiz bir yanıt döndürdü (HTTP ${response.status}): ${responseText.slice(0, 200)}`
+                  `Sunucu geçersiz bir yanıt döndürdü (HTTP ${response.status}): ${responseText}`
                 );
               }
 
               if (!response.ok) {
-                throw new Error(
+                const fullGeminiErr =
                   parsedResult.error ||
-                    `Parça ${chunkIndex + 1} işlenirken API hatası oluştu (HTTP ${response.status}): ${responseText.slice(0, 200)}`
-                );
+                  `Parça ${chunkIndex + 1} işlenirken Gemini API hatası oluştu (HTTP ${response.status}): ${responseText}`;
+                console.error("Gemini API Hatası:", fullGeminiErr);
+                throw new Error(fullGeminiErr);
               }
 
               result = parsedResult;
               setRetryWarning(null);
               break;
             } catch (chunkErr: unknown) {
-              if (attempt >= maxAttempts) {
-                throw chunkErr;
-              }
-
-              const waitSeconds = backoffDelaysSec[attempt - 1] ?? 12;
-              const nextAttempt = attempt + 1;
-
-              for (let remaining = waitSeconds; remaining > 0; remaining--) {
-                const warningMsg = `API yoğunluğu algılandı, ${remaining} saniye içinde otomatik tekrar deneniyor... (Parça ${chunkIndex + 1}, Deneme ${nextAttempt}/${maxAttempts})`;
-                setRetryWarning(warningMsg);
-                setStatusLog(
-                  `Parça ${chunkIndex + 1} / ${chunkFileNames.length}: ${warningMsg}`
-                );
-                await new Promise((r) => setTimeout(r, 1000));
-              }
-
-              setStatusLog(
-                `Parça ${chunkIndex + 1} / ${chunkFileNames.length} yeniden gönderiliyor... (Deneme ${nextAttempt}/${maxAttempts})`
-              );
+              console.error("Gemini İstek Hatası:", chunkErr);
+              throw chunkErr;
             }
           }
         } finally {
@@ -861,35 +846,8 @@ export default function VideoToSubtitlePage() {
 
         if (!result) {
           throw new Error(
-            `Parça ${chunkIndex + 1} tüm tekrar denemelere rağmen işlenemedi.`
+            `Parça ${chunkIndex + 1} Gemini API tarafından işlenemedi.`
           );
-        }
-
-        // Eğer konuşma modundaysa ve sunucuda LLM redaksiyonu henüz uygulanmadıysa /api/refine üzerinden kesin olarak geçir
-        if (
-          !isMusicMode &&
-          !result.llmApplied &&
-          Array.isArray(result.segments) &&
-          result.segments.length > 0
-        ) {
-          try {
-            const refineRes = await fetch("/api/refine", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ segments: result.segments }),
-            });
-            if (refineRes.ok) {
-              const refineData = await refineRes.json();
-              if (Array.isArray(refineData.segments)) {
-                result.segments = refineData.segments;
-                result.llmApplied = refineData.llmApplied;
-                result.modelUsed = refineData.modelUsed;
-                result.firstLine = refineData.firstLine;
-              }
-            }
-          } catch (refineErr) {
-            console.warn("[/api/refine] Yedek tamir isteği uyarısı:", refineErr);
-          }
         }
 
         console.log(
@@ -1537,9 +1495,11 @@ export default function VideoToSubtitlePage() {
                 className="mt-4 rounded-xl border border-red-500/40 bg-red-500/10 p-4 flex items-start gap-3 text-red-200"
               >
                 <AlertCircle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
-                <div className="text-xs sm:text-sm space-y-1">
-                  <p className="font-semibold text-red-300">İşlem Başarısız</p>
-                  <p className="text-red-200/90">{errorMessage}</p>
+                <div className="text-xs sm:text-sm space-y-1 min-w-0 flex-1">
+                  <p className="font-semibold text-red-300">İşlem Başarısız (Gemini API Yanıtı)</p>
+                  <pre className="text-red-200/90 whitespace-pre-wrap break-words font-mono text-xs bg-zinc-950/70 p-3 rounded-lg border border-red-500/20 overflow-x-auto">
+                    {errorMessage}
+                  </pre>
                 </div>
               </motion.div>
             )}

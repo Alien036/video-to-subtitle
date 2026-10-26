@@ -4,7 +4,7 @@ export const maxDuration = 60;
 
 let roundRobinCounter = Math.floor(Math.random() * 1000);
 
-const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"];
+const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest"];
 
 function formatMMSS(seconds: number): string {
   const safeSec =
@@ -45,16 +45,14 @@ function getGeminiApiKeysPool(): string[] {
     .filter(Boolean);
 }
 
-function parseGeminiLyricsLines(rawOutput: string): Array<{
+function parseGeminiLyricsOutput(rawOutput: string): Array<{
   id: number;
   start: number;
   end: number;
   text: string;
 }> {
-  const lines = rawOutput
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
+  const trimmed = (rawOutput || "").trim();
+  if (!trimmed) return [];
 
   const parsed: Array<{
     id: number;
@@ -63,24 +61,100 @@ function parseGeminiLyricsLines(rawOutput: string): Array<{
     text: string;
   }> = [];
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const match = line.match(
-      /^(?:\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*)?(.*)$/
-    );
-    if (!match) continue;
+  const cleanedJsonCandidate = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
 
-    const tsStr = match[1];
-    const contentRaw = cleanMusicSegmentText(match[2] || "");
-    if (!contentRaw) continue;
+  if (
+    cleanedJsonCandidate.startsWith("[") ||
+    cleanedJsonCandidate.startsWith("{")
+  ) {
+    try {
+      const jsonObj = JSON.parse(cleanedJsonCandidate);
+      const list = Array.isArray(jsonObj)
+        ? jsonObj
+        : Array.isArray(jsonObj?.segments)
+        ? jsonObj.segments
+        : Array.isArray(jsonObj?.lines)
+        ? jsonObj.lines
+        : null;
 
-    const startSec = tsStr ? parseTimestampToSeconds(tsStr) : i * 4;
-    parsed.push({
-      id: parsed.length + 1,
-      start: startSec,
-      end: startSec + 4,
-      text: contentRaw,
-    });
+      if (Array.isArray(list)) {
+        for (let i = 0; i < list.length; i++) {
+          const item = list[i];
+          if (typeof item === "string") {
+            const match = item
+              .trim()
+              .match(/^(?:\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*)?(.*)$/);
+            const tsStr = match?.[1];
+            const cleaned = cleanMusicSegmentText(match?.[2] || item);
+            if (!cleaned) continue;
+            const startSec = tsStr ? parseTimestampToSeconds(tsStr) : i * 4;
+            parsed.push({
+              id: parsed.length + 1,
+              start: startSec,
+              end: startSec + 4,
+              text: cleaned,
+            });
+          } else if (item && typeof item === "object") {
+            const rawText = cleanMusicSegmentText(
+              String(item.text ?? item.content ?? item.line ?? "")
+            );
+            if (!rawText) continue;
+            const startVal =
+              typeof item.start === "number"
+                ? item.start
+                : typeof item.timestamp === "string"
+                ? parseTimestampToSeconds(item.timestamp.replace(/[\[\]]/g, ""))
+                : typeof item.time === "string"
+                ? parseTimestampToSeconds(item.time.replace(/[\[\]]/g, ""))
+                : i * 4;
+            const endVal =
+              typeof item.end === "number" && item.end > startVal
+                ? item.end
+                : startVal + 4;
+            parsed.push({
+              id: parsed.length + 1,
+              start: startVal,
+              end: endVal,
+              text: rawText,
+            });
+          }
+        }
+      }
+    } catch {
+      // Satır bazlı ayrıştırmaya devam et
+    }
+  }
+
+  if (parsed.length === 0) {
+    const lines = trimmed
+      .replace(/^```[a-z]*\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const match = line.match(
+        /^(?:\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*)?(.*)$/
+      );
+      if (!match) continue;
+
+      const tsStr = match[1];
+      const contentRaw = cleanMusicSegmentText(match[2] || "");
+      if (!contentRaw) continue;
+
+      const startSec = tsStr ? parseTimestampToSeconds(tsStr) : i * 4;
+      parsed.push({
+        id: parsed.length + 1,
+        start: startSec,
+        end: startSec + 4,
+        text: contentRaw,
+      });
+    }
   }
 
   for (let i = 0; i < parsed.length - 1; i++) {
@@ -137,91 +211,109 @@ export async function POST(request: NextRequest) {
     const errorDetails: string[] = [];
     let lastStatus = 500;
 
-    for (const geminiModel of GEMINI_MODELS) {
+    const promptText = `Bu müzik/şarkı kaydının sözlerini (lyrics) nakarat tekrarlarını, kafiyeleri ve vokal satırlarını hiç silmeden zaman damgalı olarak çıkar.
+${previousContext ? `Önceki parçanın son satırı: "${previousContext}"` : ""}
+Çıktıyı her satır yeni satırda (\\n\\n) olacak şekilde şu formatta ver:
+[DD:SS] şarkı sözü satırı`;
+
+    for (const model of GEMINI_MODELS) {
       for (let offset = 0; offset < geminiKeys.length; offset++) {
         const keyIndex = (geminiStartIndex + offset) % geminiKeys.length;
         const apiKey = geminiKeys[keyIndex];
 
-        try {
-          const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`;
-          const geminiResponse = await fetch(geminiUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-goog-api-key": apiKey,
-            },
-            body: JSON.stringify({
-              contents: [
-                {
-                  parts: [
-                    {
-                      inline_data: {
-                        mime_type: fileType,
-                        data: base64Audio,
-                      },
-                    },
-                    {
-                      text: `Bu müzik/şarkı kaydının sözlerini (lyrics) nakarat tekrarlarını, kafiyeleri ve vokal satırlarını hiç silmeden zaman damgalı olarak çıkar.
-${previousContext ? `Önceki parçanın son satırı: "${previousContext}"` : ""}
-Çıktıyı her satır yeni satırda (\\n\\n) olacak şekilde şu formatta ver:
-[DD:SS] şarkı sözü satırı`,
-                    },
-                  ],
-                },
-              ],
-              generationConfig: {
-                temperature: 0.1,
+        const endpoints = [
+          {
+            name: "GoogleAI (generativelanguage)",
+            url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          },
+          {
+            name: "VertexAI (aiplatform)",
+            url: `https://aiplatform.googleapis.com/v1/publishers/google/models/${model}:generateContent?key=${apiKey}`,
+          },
+        ];
+
+        for (const ep of endpoints) {
+          try {
+            const geminiResponse = await fetch(ep.url, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-goog-api-key": apiKey,
               },
-            }),
-          });
-
-          const rawResponseBody = await geminiResponse.text();
-
-          if (!geminiResponse.ok) {
-            lastStatus = geminiResponse.status;
-            const detail = `[Model: ${geminiModel} | Key #${keyIndex + 1} | HTTP ${geminiResponse.status}] Google Yanıtı: ${rawResponseBody}`;
-            console.error("[/api/transcribe-music] Gemini API Hatası:", detail);
-            errorDetails.push(detail);
-            continue;
-          }
-
-          const geminiData = JSON.parse(rawResponseBody);
-          const rawText: string =
-            geminiData?.candidates?.[0]?.content?.parts
-              ?.map((p: { text?: string }) => p.text || "")
-              .join("\n")
-              .trim() || "";
-
-          const parsedSegments = parseGeminiLyricsLines(rawText);
-          if (parsedSegments.length > 0) {
-            const formattedLyrics = parsedSegments
-              .map((s) => `[${formatMMSS(s.start)}] ${s.text}`)
-              .join("\n\n");
-
-            return NextResponse.json({
-              segments: parsedSegments,
-              text: formattedLyrics,
-              llmApplied: true,
-              modelUsed: geminiModel,
-              language,
-              duration: 240,
+              body: JSON.stringify({
+                contents: [
+                  {
+                    role: "user",
+                    parts: [
+                      {
+                        inlineData: {
+                          mimeType: fileType,
+                          data: base64Audio,
+                        },
+                      },
+                      {
+                        text: promptText,
+                      },
+                    ],
+                  },
+                ],
+                generationConfig: {
+                  temperature: 0.1,
+                },
+              }),
             });
-          } else {
-            const emptyDetail = `[Model: ${geminiModel} | Key #${keyIndex + 1}] Gemini boş veya ayrıştırılamayan yanıt döndürdü: ${rawResponseBody}`;
-            console.error("[/api/transcribe-music]", emptyDetail);
-            errorDetails.push(emptyDetail);
+
+            const rawResponseBody = await geminiResponse.text();
+
+            if (!geminiResponse.ok) {
+              lastStatus = geminiResponse.status;
+              const detail = `[${ep.name} | Model: ${model} | Key #${keyIndex + 1} | HTTP ${geminiResponse.status}] Google Yanıtı: ${rawResponseBody}`;
+              console.error(
+                "[/api/transcribe-music] Gemini API Hatası:",
+                detail
+              );
+              errorDetails.push(detail);
+              continue;
+            }
+
+            const geminiData = JSON.parse(rawResponseBody);
+            const rawText: string =
+              geminiData?.candidates?.[0]?.content?.parts
+                ?.map((p: { text?: string }) => p.text || "")
+                .join("\n")
+                .trim() || "";
+
+            const parsedSegments = parseGeminiLyricsOutput(rawText);
+            if (parsedSegments.length > 0) {
+              const formattedLyrics = parsedSegments
+                .map((s) => `[${formatMMSS(s.start)}] ${s.text}`)
+                .join("\n\n");
+
+              return NextResponse.json({
+                segments: parsedSegments,
+                text: formattedLyrics,
+                llmApplied: true,
+                modelUsed: model,
+                language,
+                duration: 240,
+              });
+            } else {
+              const emptyDetail = `[${ep.name} | Model: ${model} | Key #${keyIndex + 1}] Gemini boş veya ayrıştırılamayan yanıt döndürdü: ${rawResponseBody}`;
+              console.error("[/api/transcribe-music]", emptyDetail);
+              errorDetails.push(emptyDetail);
+            }
+          } catch (geminiErr: unknown) {
+            const errMsg =
+              geminiErr instanceof Error
+                ? `${geminiErr.name}: ${geminiErr.message}`
+                : String(geminiErr);
+            const detail = `[${ep.name} | Model: ${model} | Key #${keyIndex + 1}] İstek Hatası: ${errMsg}`;
+            console.error(
+              "[/api/transcribe-music] Gemini İstisna Hatası:",
+              detail
+            );
+            errorDetails.push(detail);
           }
-        } catch (geminiErr: unknown) {
-          const errMsg =
-            geminiErr instanceof Error
-              ? `${geminiErr.name}: ${geminiErr.message}`
-              : String(geminiErr);
-          const detail = `[Model: ${geminiModel} | Key #${keyIndex + 1}] İstek Hatası: ${errMsg}`;
-          console.error(
-            "[/api/transcribe-music] Gemini İstisna Hatası:",
-            detail
-          );
-          errorDetails.push(detail);
         }
       }
     }

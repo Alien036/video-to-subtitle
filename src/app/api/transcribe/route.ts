@@ -12,7 +12,7 @@ let roundRobinCounter = Math.floor(Math.random() * 1000);
 const COUNSELING_TERMS_PROMPT =
   "Danışman, danışan, süpervizörüm, YKS dönemi, sınav dönemi, balık etli, yurt, kütüphane";
 
-const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"];
+const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-latest"];
 
 export function formatMMSS(seconds: number): string {
   const safeSec =
@@ -40,16 +40,14 @@ function getGeminiApiKeysPool(): string[] {
     .filter(Boolean);
 }
 
-function parseGeminiDialogueLines(rawOutput: string): Array<{
+function parseGeminiDialogueOutput(rawOutput: string): Array<{
   id: number;
   start: number;
   end: number;
   text: string;
 }> {
-  const lines = rawOutput
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
+  const trimmed = (rawOutput || "").trim();
+  if (!trimmed) return [];
 
   const parsed: Array<{
     id: number;
@@ -58,29 +56,116 @@ function parseGeminiDialogueLines(rawOutput: string): Array<{
     text: string;
   }> = [];
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const match = line.match(
-      /^(?:\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*)?(.*)$/
-    );
-    if (!match) continue;
+  // 1. Eğer JSON formatında döndüyse (Array veya { segments: [...] }) parse et
+  const cleanedJsonCandidate = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
 
-    const tsStr = match[1];
-    const contentRaw = (match[2] || "").trim();
-    if (!contentRaw) continue;
+  if (
+    cleanedJsonCandidate.startsWith("[") ||
+    cleanedJsonCandidate.startsWith("{")
+  ) {
+    try {
+      const jsonObj = JSON.parse(cleanedJsonCandidate);
+      const list = Array.isArray(jsonObj)
+        ? jsonObj
+        : Array.isArray(jsonObj?.segments)
+        ? jsonObj.segments
+        : Array.isArray(jsonObj?.lines)
+        ? jsonObj.lines
+        : null;
 
-    const cleaned = applyDeterministicTurkishFixes(contentRaw);
-    if (!cleaned) continue;
+      if (Array.isArray(list)) {
+        for (let i = 0; i < list.length; i++) {
+          const item = list[i];
+          if (typeof item === "string") {
+            const match = item
+              .trim()
+              .match(/^(?:\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*)?(.*)$/);
+            const tsStr = match?.[1];
+            const rawLine = (match?.[2] || item).trim();
+            const cleaned = applyDeterministicTurkishFixes(rawLine);
+            if (!cleaned) continue;
+            const startSec = tsStr ? parseTimestampToSeconds(tsStr) : i * 5;
+            parsed.push({
+              id: parsed.length + 1,
+              start: startSec,
+              end: startSec + 5,
+              text: ensureCounselingSpeakerLabel(cleaned, parsed.length),
+            });
+          } else if (item && typeof item === "object") {
+            const rawText = String(
+              item.text ?? item.content ?? item.line ?? ""
+            ).trim();
+            if (!rawText) continue;
+            const speakerRaw = String(item.speaker ?? item.role ?? "").trim();
+            const combined = speakerRaw
+              ? `**${speakerRaw.replace(/[:*]/g, "").trim()}:** ${rawText}`
+              : rawText;
+            const cleaned = applyDeterministicTurkishFixes(combined);
+            if (!cleaned) continue;
 
-    const startSec = tsStr ? parseTimestampToSeconds(tsStr) : i * 5;
-    const labeledText = ensureCounselingSpeakerLabel(cleaned, parsed.length);
+            const startVal =
+              typeof item.start === "number"
+                ? item.start
+                : typeof item.timestamp === "string"
+                ? parseTimestampToSeconds(item.timestamp.replace(/[\[\]]/g, ""))
+                : typeof item.time === "string"
+                ? parseTimestampToSeconds(item.time.replace(/[\[\]]/g, ""))
+                : i * 5;
+            const endVal =
+              typeof item.end === "number" && item.end > startVal
+                ? item.end
+                : startVal + 5;
 
-    parsed.push({
-      id: parsed.length + 1,
-      start: startSec,
-      end: startSec + 5,
-      text: labeledText,
-    });
+            parsed.push({
+              id: parsed.length + 1,
+              start: startVal,
+              end: endVal,
+              text: ensureCounselingSpeakerLabel(cleaned, parsed.length),
+            });
+          }
+        }
+      }
+    } catch {
+      // JSON değilse aşağıdaki satır bazlı ayrıştırıcıya devam et
+    }
+  }
+
+  // 2. Düz metin ([DD:SS] **Danışman:** ...) olarak döndüyse satır satır ayrıştır
+  if (parsed.length === 0) {
+    const lines = trimmed
+      .replace(/^```[a-z]*\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const match = line.match(
+        /^(?:\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*)?(.*)$/
+      );
+      if (!match) continue;
+
+      const tsStr = match[1];
+      const contentRaw = (match[2] || "").trim();
+      if (!contentRaw) continue;
+
+      const cleaned = applyDeterministicTurkishFixes(contentRaw);
+      if (!cleaned) continue;
+
+      const startSec = tsStr ? parseTimestampToSeconds(tsStr) : i * 5;
+      const labeledText = ensureCounselingSpeakerLabel(cleaned, parsed.length);
+
+      parsed.push({
+        id: parsed.length + 1,
+        start: startSec,
+        end: startSec + 5,
+        text: labeledText,
+      });
+    }
   }
 
   for (let i = 0; i < parsed.length - 1; i++) {
@@ -136,92 +221,107 @@ export async function POST(request: NextRequest) {
     const errorDetails: string[] = [];
     let lastStatus = 500;
 
-    for (const geminiModel of GEMINI_MODELS) {
-      for (let offset = 0; offset < geminiKeys.length; offset++) {
-        const keyIndex = (geminiStartIndex + offset) % geminiKeys.length;
-        const apiKey = geminiKeys[keyIndex];
-
-        try {
-          const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`;
-          const geminiResponse = await fetch(geminiUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-goog-api-key": apiKey,
-            },
-            body: JSON.stringify({
-              contents: [
-                {
-                  parts: [
-                    {
-                      inline_data: {
-                        mime_type: fileType,
-                        data: base64Audio,
-                      },
-                    },
-                    {
-                      text: `Bu Türkçe psikolojik danışmanlık görüşmesi ses kaydını hiçbir kısık sesi veya cümleyi atlamadan (sıfır veri kaybıyla) deşifre et.
+    const promptText = `Bu Türkçe psikolojik danışmanlık görüşmesi ses kaydını hiçbir kısık sesi veya cümleyi atlamadan (sıfır veri kaybıyla) deşifre et.
 Psikolojik danışmanlık terimlerine dikkat et: "${COUNSELING_TERMS_PROMPT}".
 ${previousContext ? `Önceki parçanın son cümlesi (bağlam): "${previousContext}"` : ""}
 Çıktıyı KESİNLİKLE şu formatta, her konuşma yeni satırda (\\n\\n) olacak şekilde üret:
 [DD:SS] **Danışman:** ...
 
-[DD:SS] **Danışan:** ...`,
-                    },
-                  ],
-                },
-              ],
-              generationConfig: {
-                temperature: 0.1,
+[DD:SS] **Danışan:** ...`;
+
+    for (const model of GEMINI_MODELS) {
+      for (let offset = 0; offset < geminiKeys.length; offset++) {
+        const keyIndex = (geminiStartIndex + offset) % geminiKeys.length;
+        const apiKey = geminiKeys[keyIndex];
+
+        const endpoints = [
+          {
+            name: "GoogleAI (generativelanguage)",
+            url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          },
+          {
+            name: "VertexAI (aiplatform)",
+            url: `https://aiplatform.googleapis.com/v1/publishers/google/models/${model}:generateContent?key=${apiKey}`,
+          },
+        ];
+
+        for (const ep of endpoints) {
+          try {
+            const geminiResponse = await fetch(ep.url, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-goog-api-key": apiKey,
               },
-            }),
-          });
-
-          const rawResponseBody = await geminiResponse.text();
-
-          if (!geminiResponse.ok) {
-            lastStatus = geminiResponse.status;
-            const detail = `[Model: ${geminiModel} | Key #${keyIndex + 1} | HTTP ${geminiResponse.status}] Google Yanıtı: ${rawResponseBody}`;
-            console.error("[/api/transcribe] Gemini API Hatası:", detail);
-            errorDetails.push(detail);
-            continue;
-          }
-
-          const geminiData = JSON.parse(rawResponseBody);
-          const rawText: string =
-            geminiData?.candidates?.[0]?.content?.parts
-              ?.map((p: { text?: string }) => p.text || "")
-              .join("\n")
-              .trim() || "";
-
-          const parsedSegments = parseGeminiDialogueLines(rawText);
-          if (parsedSegments.length > 0) {
-            const formattedText = parsedSegments
-              .map((s) => `[${formatMMSS(s.start)}] ${s.text}`)
-              .join("\n\n");
-
-            return NextResponse.json({
-              segments: parsedSegments,
-              text: formattedText,
-              llmApplied: true,
-              modelUsed: geminiModel,
-              firstLine: parsedSegments[0]?.text || "",
-              language,
-              duration: 240,
+              body: JSON.stringify({
+                contents: [
+                  {
+                    role: "user",
+                    parts: [
+                      {
+                        inlineData: {
+                          mimeType: fileType,
+                          data: base64Audio,
+                        },
+                      },
+                      {
+                        text: promptText,
+                      },
+                    ],
+                  },
+                ],
+                generationConfig: {
+                  temperature: 0.1,
+                },
+              }),
             });
-          } else {
-            const emptyDetail = `[Model: ${geminiModel} | Key #${keyIndex + 1}] Gemini boş veya ayrıştırılamayan yanıt döndürdü: ${rawResponseBody}`;
-            console.error("[/api/transcribe]", emptyDetail);
-            errorDetails.push(emptyDetail);
+
+            const rawResponseBody = await geminiResponse.text();
+
+            if (!geminiResponse.ok) {
+              lastStatus = geminiResponse.status;
+              const detail = `[${ep.name} | Model: ${model} | Key #${keyIndex + 1} | HTTP ${geminiResponse.status}] Google Yanıtı: ${rawResponseBody}`;
+              console.error("[/api/transcribe] Gemini API Hatası:", detail);
+              errorDetails.push(detail);
+              continue;
+            }
+
+            const geminiData = JSON.parse(rawResponseBody);
+            const rawText: string =
+              geminiData?.candidates?.[0]?.content?.parts
+                ?.map((p: { text?: string }) => p.text || "")
+                .join("\n")
+                .trim() || "";
+
+            const parsedSegments = parseGeminiDialogueOutput(rawText);
+            if (parsedSegments.length > 0) {
+              const formattedText = parsedSegments
+                .map((s) => `[${formatMMSS(s.start)}] ${s.text}`)
+                .join("\n\n");
+
+              return NextResponse.json({
+                segments: parsedSegments,
+                text: formattedText,
+                llmApplied: true,
+                modelUsed: model,
+                firstLine: parsedSegments[0]?.text || "",
+                language,
+                duration: 240,
+              });
+            } else {
+              const emptyDetail = `[${ep.name} | Model: ${model} | Key #${keyIndex + 1}] Gemini boş veya ayrıştırılamayan yanıt döndürdü: ${rawResponseBody}`;
+              console.error("[/api/transcribe]", emptyDetail);
+              errorDetails.push(emptyDetail);
+            }
+          } catch (geminiErr: unknown) {
+            const errMsg =
+              geminiErr instanceof Error
+                ? `${geminiErr.name}: ${geminiErr.message}`
+                : String(geminiErr);
+            const detail = `[${ep.name} | Model: ${model} | Key #${keyIndex + 1}] İstek Hatası: ${errMsg}`;
+            console.error("[/api/transcribe] Gemini İstisna Hatası:", detail);
+            errorDetails.push(detail);
           }
-        } catch (geminiErr: unknown) {
-          const errMsg =
-            geminiErr instanceof Error
-              ? `${geminiErr.name}: ${geminiErr.message}`
-              : String(geminiErr);
-          const detail = `[Model: ${geminiModel} | Key #${keyIndex + 1}] İstek Hatası: ${errMsg}`;
-          console.error("[/api/transcribe] Gemini İstisna Hatası:", detail);
-          errorDetails.push(detail);
         }
       }
     }
@@ -231,7 +331,10 @@ ${previousContext ? `Önceki parçanın son cümlesi (bağlam): "${previousConte
         ? errorDetails.join("\n\n")
         : "Gemini API'den geçerli bir yanıt alınamadı.";
 
-    console.error("[/api/transcribe] Tüm Gemini denemeleri başarısız oldu:\n", fullErrorReport);
+    console.error(
+      "[/api/transcribe] Tüm Gemini denemeleri başarısız oldu:\n",
+      fullErrorReport
+    );
 
     return NextResponse.json(
       {

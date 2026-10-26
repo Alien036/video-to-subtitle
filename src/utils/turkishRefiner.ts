@@ -146,7 +146,7 @@ export async function refineSegmentsWithLLM(
         const completion = await llmGroq.chat.completions.create({
           model: modelName,
           temperature: 0.1,
-          max_tokens: 8000,
+          max_tokens: 4096,
           messages: [
             {
               role: "system",

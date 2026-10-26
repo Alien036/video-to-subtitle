@@ -25,7 +25,6 @@ const MUSIC_BASE_PROMPT =
   "Şarkı sözleri, Türkçe rap, pop, nakarat, kafiyeli vokal kaydı.";
 
 const MUSIC_MODELS_CHAIN = [
-  "llama-3.3-70b-versatile",
   "openai/gpt-oss-120b",
   "qwen/qwen3.8-27b",
   "openai/gpt-oss-20b",
@@ -226,7 +225,7 @@ export async function POST(request: NextRequest) {
                   const completion = await llmGroq.chat.completions.create({
                     model: modelName,
                     temperature: 0.1,
-                    max_tokens: 8000,
+                    max_tokens: 4096,
                     messages: [
                       {
                         role: "system",

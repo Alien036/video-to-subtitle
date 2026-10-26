@@ -32,6 +32,7 @@ import {
   Shield,
   Loader2,
   Zap,
+  Monitor,
 } from "lucide-react";
 import { auth, db } from "@/lib/firebase";
 import {
@@ -1269,6 +1270,19 @@ export default function VideoToSubtitlePage() {
 
       {/* Ana İçerik */}
       <main className="relative z-10 mx-auto max-w-6xl px-6 py-10 space-y-8">
+        {/* Bilgisayardan (PC) Kullanım Önerisi Bilgi Bandı */}
+        <motion.div
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs sm:text-sm px-4 py-2.5 rounded-xl flex items-center justify-center gap-2.5 shadow-[0_0_20px_rgba(245,158,11,0.08)]"
+        >
+          <Monitor className="h-4 w-4 shrink-0 text-amber-400" />
+          <span>
+            💻 Yüksek boyutlu video ve ses dosyalarının çok daha hızlı işlenmesi
+            için işlemlerin bilgisayardan (PC) yapılması önerilir.
+          </span>
+        </motion.div>
+
         {/* Başlık Bölümü */}
         <div className="text-center max-w-3xl mx-auto space-y-3">
           <motion.div

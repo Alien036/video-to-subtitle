@@ -24,6 +24,7 @@ import {
   Sparkles,
   ArrowRight,
   ShieldCheck,
+  Monitor,
 } from "lucide-react";
 import { auth, db, googleProvider } from "@/lib/firebase";
 import { doc, updateDoc } from "firebase/firestore";
@@ -627,6 +628,15 @@ export default function AuthView({
               <p className="text-xs text-zinc-400">
                 5 GB+ Video Ses Ayrıştırma & Groq Whisper Altyazı Platformu
               </p>
+            </div>
+
+            {/* Bilgisayardan (PC) Kullanım Önerisi Bilgi Bandı */}
+            <div className="bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs px-3.5 py-2.5 rounded-xl flex items-center gap-2.5 leading-relaxed shadow-[0_0_15px_rgba(245,158,11,0.08)]">
+              <Monitor className="h-4 w-4 shrink-0 text-amber-400" />
+              <span>
+                💻 Yüksek boyutlu video ve ses dosyalarının çok daha hızlı
+                işlenmesi için işlemlerin bilgisayardan (PC) yapılması önerilir.
+              </span>
             </div>
 
             {/* Üst Sekmeler (Giriş Yap / Kayıt Ol) */}

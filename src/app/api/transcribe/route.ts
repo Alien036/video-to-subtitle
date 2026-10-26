@@ -115,28 +115,12 @@ export function isHallucinatedSegment(
   },
   segmentIndex = 0
 ): boolean {
-  // 1. Sessizlik olasılığı yüksekse filtrele
-  if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.5) {
-    return true;
-  }
-
-  // 2. Sessizlik ihtimali orta düzeyde olup modelin kelime güveni (avg_logprob) çok düşükse filtrele
+  // Sadece gerçek sessizlikte (no_speech_prob > 0.85) ve çok düşük güvende olan gürültüyü filtrele (Sıfır Veri Kaybı)
   if (
     typeof seg.no_speech_prob === "number" &&
-    seg.no_speech_prob > 0.35 &&
+    seg.no_speech_prob > 0.85 &&
     typeof seg.avg_logprob === "number" &&
-    seg.avg_logprob < -0.9
-  ) {
-    return true;
-  }
-
-  // 3. Model tamamen düşük güvenle uyduruyorsa veya şarkı nakaratı kısır döngüsündeyse filtrele
-  if (typeof seg.avg_logprob === "number" && seg.avg_logprob < -1.35) {
-    return true;
-  }
-  if (
-    typeof seg.compression_ratio === "number" &&
-    seg.compression_ratio > 2.2
+    seg.avg_logprob < -1.2
   ) {
     return true;
   }

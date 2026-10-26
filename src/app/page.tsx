@@ -143,7 +143,7 @@ function isHallucinatedSegment(
   },
   segmentIndex = 0
 ): boolean {
-  if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.5) {
+  if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.85) {
     return true;
   }
 
@@ -645,7 +645,7 @@ export default function VideoToSubtitlePage() {
         ]);
       } else {
         setStatusLog(
-          "İnsan sesi izolasyonu ve fon müziği bastırma (120Hz-4000Hz Vocal Band + afftdn + dynaudnorm) aktif: 16kHz Mono 64kbps MP3 parçaları (~1.9 MB / 4 dk) üretiliyor..."
+          "Tam transkript ve ses yükseltme (highpass=85Hz + dynaudnorm) aktif: 16kHz Mono 64kbps MP3 parçaları (~1.9 MB / 4 dk) üretiliyor..."
         );
 
         exitCode = await activeFfmpeg.exec([
@@ -659,12 +659,11 @@ export default function VideoToSubtitlePage() {
           "1",
           "-ar",
           "16000", // KESİNLİKLE 16kHz (Kelime yutulmasını önler!)
-          // İNSAN SESİ İZOLASYONU VE FON MÜZİĞİ BASTIRMA FİLTRESİ:
-          // highpass=f=120,lowpass=f=4000 -> Fon müziğinin bas ve tiz enstrümanlarını kesip Vocal Band (120Hz - 4000Hz) aralığını öne çıkarır
-          // afftdn=nf=-25 -> Arka plan müziğini ve gürültüyü FFT ile sönümler
+          // SIFIR VERİ KAYBI VE DİNAMİK SES YÜKSELTME FİLTRESİ:
+          // highpass=f=85 -> Sadece dip uğultuyu temizler, Türkçe s/ş/ç harflerini (8000Hz'e kadar) korur
           // dynaudnorm=f=150:g=15 -> Kısık sesle/uzaktan konuşan kişinin sesini otomatik yükseltir ve dengeler!
           "-af",
-          "highpass=f=120,lowpass=f=4000,afftdn=nf=-25,dynaudnorm=f=150:g=15",
+          "highpass=f=85,dynaudnorm=f=150:g=15",
           "-c:a",
           "libmp3lame",
           "-b:a",
@@ -1788,10 +1787,7 @@ export default function VideoToSubtitlePage() {
                         onClick={() => {
                           const directRefinedTxt =
                             segments.length > 0
-                              ? segments
-                                  .map((s) => s.text.trim())
-                                  .filter(Boolean)
-                                  .join(" ")
+                              ? generatePlainTextContent(segments)
                               : plainText;
                           downloadFile(
                             directRefinedTxt,

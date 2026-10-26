@@ -50,7 +50,26 @@ export function generateSrtContent(segments: SubtitleSegment[]): string {
 }
 
 /**
- * Tüm altyazı segmentlerini zaman damgasız düz metin (.txt) formatına dönüştürür.
+ * Saniye cinsinden zaman değerini kısa diyalog zaman damgasına (MM:SS veya HH:MM:SS) dönüştürür.
+ */
+export function formatDialogueTime(seconds: number): string {
+  const safeSeconds = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const secs = safeSeconds % 60;
+
+  const mm = String(minutes).padStart(2, "0");
+  const ss = String(secs).padStart(2, "0");
+
+  if (hours > 0) {
+    const hh = String(hours).padStart(2, "0");
+    return `${hh}:${mm}:${ss}`;
+  }
+  return `${mm}:${ss}`;
+}
+
+/**
+ * Tüm altyazı segmentlerini zaman damgalı diyalog formatında (.txt) okunaklı satırlara dönüştürür.
  */
 export function generatePlainTextContent(segments: SubtitleSegment[]): string {
   if (!Array.isArray(segments) || segments.length === 0) {
@@ -58,9 +77,14 @@ export function generatePlainTextContent(segments: SubtitleSegment[]): string {
   }
 
   return segments
-    .map((segment) => segment.text.trim())
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .filter((segment) => segment.text && segment.text.trim().length > 0)
+    .map((segment) => {
+      const startStr = formatDialogueTime(segment.start);
+      const endStr = formatDialogueTime(
+        segment.end > segment.start ? segment.end : segment.start + 1
+      );
+      const cleanText = segment.text.trim().replace(/\s+/g, " ");
+      return `[${startStr} - ${endStr}] ${cleanText}`;
+    })
+    .join("\n");
 }

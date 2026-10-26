@@ -154,8 +154,7 @@ export async function refineSegmentsWithLLM(
 GÖREVİN:
 1. Ses boğukluğundan dolayı tek/iki harf olarak yarım çıkmış TÜM kopuk heceleri cümlenin gelişine göre tamir et (Örn: "Peki hayat bu t a insanlar m Arkada m" -> "Peki hayatında tam insanlar mı, arkadaşların mı?", "Tabii can biraz yedirece i b vicdan k oldu" -> "Tabii canım biraz yanacağı için böyle vicdanım kötü oldu", "Yazarken de m olmad da biliyorum do olarak" -> "Yazarken de mükemmel olmadığımı da biliyorum doğal olarak", "Bir oldu s s a ya" -> "Bir şey olduğunu söyle söyle açtım ya").
 2. Sesten yanlış duyulmuş anlamsız kelimeleri psikolojik seans bağlamına göre düzelt (Örn: "siz de de ölürsünüz" -> "siz de görürsünüz", "eğri dolar gibi şey değil" -> "elimde olan bir şey değil").
-3. Arka plandaki fon müziğinden dolayı oluşmuş "Müzik dinleyin", şarkı nakaratları veya tamamen alakasız şarkı sözü halüsinasyonları varsa o satır için "[numara] [SIL]" yaz.
-4. Satır numaralarını ([0], [1], ...) KESİNLİKLE koru ve her satırı "[numara] düzeltilmiş metin" formatında döndür. Hiçbir satırı atlama ve ekstra açıklama yazma!`,
+3. SIFIR VERİ KAYBI KURALI: Hiçbir satırı silme, birleştirme veya atlama! Satır numaralarını ([0], [1], ...) KESİNLİKLE birebir koru ve her satırı "[numara] düzeltilmiş metin" formatında döndür.`,
             },
             { role: "user", content: numberedInput },
           ],
@@ -173,8 +172,6 @@ GÖREVİN:
             if (segments[idx]) {
               const rawContent = match[2].trim();
               if (/^\[?s[iı]l\]?$/i.test(rawContent)) {
-                segments[idx].text = "";
-                updatedCount++;
                 continue;
               }
               const repaired = applyDeterministicTurkishFixes(rawContent);
@@ -187,15 +184,10 @@ GÖREVİN:
         }
 
         if (updatedCount > 0) {
-          const nonEmptySegments = segments.filter(
-            (s) => s.text && s.text.trim().length > 0
-          );
-          segments.length = 0;
-          segments.push(...nonEmptySegments);
           llmApplied = true;
           modelUsed = modelName;
           console.log(
-            `✅ LLAMA REDAKSİYONU UYGULANDI (${modelName}, ${updatedCount} satır işlendi) | İlk Satır: ${segments[0]?.text}`
+            `✅ LLAMA REDAKSİYONU UYGULANDI (${modelName}, ${updatedCount}/${segments.length} satır) | İlk Satır: ${segments[0]?.text}`
           );
           break outerLoop;
         }

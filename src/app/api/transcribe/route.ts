@@ -340,43 +340,63 @@ export async function POST(request: NextRequest) {
             }
           }
 
-          // 3. Llama-3.3-70B Tamirini 25'erli Gruplar Halinde ve Kesin Çalışacak Şekilde Yap
-          const BATCH_SIZE = 25;
-          for (let i = 0; i < filteredSegments.length; i += BATCH_SIZE) {
-            const batch = filteredSegments.slice(i, i + BATCH_SIZE);
-            const numberedLines = batch
-              .map((s, idx) => `[${i + idx}] ${s.text.trim()}`)
+          // 3. Llama-3.3-70B Tamiri: Tek İstek (Single Call) + Multi-Key Failover Mimarisi
+          if (filteredSegments.length > 0) {
+            const numberedInput = filteredSegments
+              .map((s, idx) => `[${idx}] ${s.text.trim()}`)
               .join("\n");
-            try {
-              const completion = await groq.chat.completions.create({
-                model: "llama-3.3-70b-versatile",
-                temperature: 0.1,
-                max_tokens: 4096,
-                messages: [
-                  {
-                    role: "system",
-                    content: `Sen uzman bir Türkçe deşifre redaktörüsün. Aşağıdaki numaralı satırlarda ses boğukluğundan dolayı yarım çıkmış tek harfli kopuklukları (Örn: "hayat bu t a insanlar m Arkada m" -> "hayatında tam insanlar mı, arkadaşların mı", "yedirece i b vicdan k oldu" -> "yedireceği için böyle vicdanım kötü oldu", "yazarken de m olmad da biliyorum do olarak" -> "yazarken de mükemmel olmadığımı da biliyorum doğal olarak") bağlama göre tamir et. Ayrıca sesten yanlış duyulmuş anlamsız kelimeleri ("siz de de ölürsünüz" -> "siz de görürsünüz", "eğri dolar gibi" -> "elimde olan bir şey") psikolojik danışmanlık seansı bağlamına uygun düzelt. Sadece "[numara] düzeltilmiş metin" formatında yanıt ver.`,
-                  },
-                  { role: "user", content: numberedLines },
-                ],
-              });
-              const lines = (
-                completion.choices[0]?.message?.content || ""
-              ).split("\n");
-              for (const line of lines) {
-                const match = line.match(/\[(\d+)\]\s*(.+)/);
-                if (match) {
-                  const index = parseInt(match[1], 10);
-                  if (filteredSegments[index]) {
-                    const repaired = stripPromptLeakage(match[2].trim());
-                    if (repaired) {
-                      filteredSegments[index].text = repaired;
+            const startKeyIndex = keyIndex;
+            let llmSuccess = false;
+
+            for (let k = 0; k < keys.length; k++) {
+              const llmKey = keys[(startKeyIndex + 1 + k) % keys.length];
+              const llmGroq = new Groq({ apiKey: llmKey });
+              try {
+                const completion = await llmGroq.chat.completions.create({
+                  model: "llama-3.3-70b-versatile",
+                  temperature: 0.1,
+                  max_tokens: 8000,
+                  messages: [
+                    {
+                      role: "system",
+                      content: `Sen uzman bir Türkçe psikolojik danışmanlık deşifre redaktörüsün. Sana numaralı satırlar halinde ses tanıma (Whisper) çıktısı verilecek.
+GÖREVİN:
+1. Ses boğukluğundan dolayı tek/iki harf olarak yarım çıkmış TÜM kopuk heceleri cümlenin gelişine göre tamir et (Örn: "Peki hayat bu t a insanlar m Arkada m" -> "Peki hayatında tam insanlar mı, arkadaşların mı?", "Tabii can biraz yedirece i b vicdan k oldu" -> "Tabii canım biraz yanacağı için böyle vicdanım kötü oldu", "Yazarken de m olmad da biliyorum do olarak" -> "Yazarken de mükemmel olmadığımı da biliyorum doğal olarak", "Bir oldu s s a ya" -> "Bir şey olduğunu söyle söyle açtım ya").
+2. Sesten yanlış duyulmuş anlamsız kelimeleri psikolojik seans bağlamına göre düzelt (Örn: "siz de de ölürsünüz" -> "siz de görürsünüz", "eğri dolar gibi şey değil" -> "elimde olan bir şey değil").
+3. Satır numaralarını ([0], [1], ...) KESİNLİKLE koru ve her satırı "[numara] düzeltilmiş metin" formatında döndür. Hiçbir satırı atlama ve ekstra açıklama yazma!`,
+                    },
+                    { role: "user", content: numberedInput },
+                  ],
+                });
+
+                const output = completion.choices[0]?.message?.content || "";
+                const lines = output.split("\n");
+                for (const line of lines) {
+                  const match = line.trim().match(/^\[(\d+)\]\s*(.+)$/);
+                  if (match) {
+                    const idx = parseInt(match[1], 10);
+                    if (filteredSegments[idx]) {
+                      const repaired = stripPromptLeakage(match[2].trim());
+                      if (repaired) {
+                        filteredSegments[idx].text = repaired;
+                      }
                     }
                   }
                 }
+                llmSuccess = true;
+                break; // Başarılı olduysa döngüden çık
+              } catch (err) {
+                console.warn(
+                  `Llama key ${k} hatası, sıradaki key deneniyor...`,
+                  err
+                );
               }
-            } catch (err) {
-              console.error("Llama batch error:", err);
+            }
+
+            if (!llmSuccess) {
+              console.warn(
+                "[/api/transcribe] Tüm anahtarlarla Llama-3.3 redaksiyonu denendi ancak başarısız oldu; temizlenmiş Whisper metni kullanılıyor."
+              );
             }
           }
 

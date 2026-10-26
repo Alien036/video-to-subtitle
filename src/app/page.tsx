@@ -724,21 +724,18 @@ export default function VideoToSubtitlePage() {
       setTotalChunks(chunkFileNames.length);
 
       const allSyncedSegments: SubtitleSegment[] = [];
-      const backoffDelaysSec = [3, 6, 12];
+      const allRawChunkTexts: string[] = [];
       let completedChunksCount = 0;
       const videoAudioBuffers: Uint8Array<ArrayBuffer>[] = [];
 
-      // 4. Kesin Zaman Damgası (Exact Duration Offset), Tekrar Önleme ve Bağlam Aktarımı (previousContext)
       let cumulativeOffset = 0;
-      let previousContext = "";
-      let lastAddedSegmentNorm = "";
 
       for (let chunkIndex = 0; chunkIndex < chunkFileNames.length; chunkIndex++) {
         const chunkName = chunkFileNames[chunkIndex];
 
         setRetryWarning(null);
         setStatusLog(
-          `Parça ${chunkIndex + 1} / ${chunkFileNames.length} Groq Whisper Large V3 ile işleniyor...`
+          `Parça ${chunkIndex + 1} / ${chunkFileNames.length} DeepInfra Whisper Large V3 ile işleniyor...`
         );
 
         // Anlık Bellek Yönetimi: Sadece sırası gelen parçayı MEMFS'ten oku
@@ -762,9 +759,7 @@ export default function VideoToSubtitlePage() {
           error?: string;
           text?: string;
           duration?: number;
-          llmApplied?: boolean;
           modelUsed?: string | null;
-          firstLine?: string;
           segments?: Array<{
             start: number;
             end: number;
@@ -773,67 +768,53 @@ export default function VideoToSubtitlePage() {
           }>;
         } | null = null;
 
-        const maxAttempts = 3;
         try {
-          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-              const formData = new FormData();
-              formData.append("file", chunkFile);
-              formData.append("language", language);
-              if (previousContext) {
-                formData.append("previousContext", previousContext);
-              }
+          const formData = new FormData();
+          formData.append("file", chunkFile);
+          formData.append("language", language);
 
-              const targetEndpoint = isMusicMode
-                ? "/api/transcribe-music"
-                : "/api/transcribe";
+          const targetEndpoint = isMusicMode
+            ? "/api/transcribe-music"
+            : "/api/transcribe";
 
-              const response = await fetch(targetEndpoint, {
-                method: "POST",
-                body: formData,
-              });
+          const response = await fetch(targetEndpoint, {
+            method: "POST",
+            body: formData,
+          });
 
-              const responseText = await response.text();
-              let parsedResult: {
-                error?: string;
-                text?: string;
-                duration?: number;
-                llmApplied?: boolean;
-                modelUsed?: string | null;
-                firstLine?: string;
-                segments?: Array<{
-                  start: number;
-                  end: number;
-                  text: string;
-                  no_speech_prob?: number;
-                }>;
-              };
+          const responseText = await response.text();
+          let parsedResult: {
+            error?: string;
+            text?: string;
+            duration?: number;
+            modelUsed?: string | null;
+            segments?: Array<{
+              start: number;
+              end: number;
+              text: string;
+              no_speech_prob?: number;
+            }>;
+          };
 
-              try {
-                parsedResult = JSON.parse(responseText);
-              } catch {
-                console.error("Gemini API Ham Hata Yanıtı:", responseText);
-                throw new Error(
-                  `Sunucu geçersiz bir yanıt döndürdü (HTTP ${response.status}): ${responseText}`
-                );
-              }
-
-              if (!response.ok) {
-                const fullGeminiErr =
-                  parsedResult.error ||
-                  `Parça ${chunkIndex + 1} işlenirken Gemini API hatası oluştu (HTTP ${response.status}): ${responseText}`;
-                console.error("Gemini API Hatası:", fullGeminiErr);
-                throw new Error(fullGeminiErr);
-              }
-
-              result = parsedResult;
-              setRetryWarning(null);
-              break;
-            } catch (chunkErr: unknown) {
-              console.error("Gemini İstek Hatası:", chunkErr);
-              throw chunkErr;
-            }
+          try {
+            parsedResult = JSON.parse(responseText);
+          } catch {
+            console.error("DeepInfra API Ham Hata Yanıtı:", responseText);
+            throw new Error(
+              `Sunucu geçersiz bir yanıt döndürdü (HTTP ${response.status}): ${responseText}`
+            );
           }
+
+          if (!response.ok) {
+            const fullErr =
+              parsedResult.error ||
+              `Parça ${chunkIndex + 1} işlenirken DeepInfra API hatası oluştu (HTTP ${response.status}): ${responseText}`;
+            console.error("DeepInfra API Hatası:", fullErr);
+            throw new Error(fullErr);
+          }
+
+          result = parsedResult;
+          setRetryWarning(null);
         } finally {
           // Anlık Bellek Temizliği (Streaming Garbage Collection):
           // /api/transcribe isteği tamamlandığı anda bir sonraki parçaya geçmeden hemen önce RAM'den sil!
@@ -846,14 +827,9 @@ export default function VideoToSubtitlePage() {
 
         if (!result) {
           throw new Error(
-            `Parça ${chunkIndex + 1} Gemini API tarafından işlenemedi.`
+            `Parça ${chunkIndex + 1} DeepInfra API tarafından işlenemedi.`
           );
         }
-
-        console.log(
-          "✅ LLAMA REDAKSİYONU UYGULANDI",
-          result.firstLine || result.segments?.[0]?.text || ""
-        );
 
         completedChunksCount += 1;
         setCurrentChunkIndex(completedChunksCount);
@@ -863,80 +839,31 @@ export default function VideoToSubtitlePage() {
             ? result.duration
             : segmentTime;
 
-        const validChunkTexts: string[] = [];
+        if (typeof result.text === "string" && result.text.trim().length > 0) {
+          allRawChunkTexts.push(result.text.trim());
+        }
 
-        if (isMusicMode) {
-          // Şarkı / Müzik Modu: Nakarat tekrarlarını ve vokal satırlarını silmeden doğrudan ekle
-          if (Array.isArray(result.segments)) {
-            for (const seg of result.segments) {
-              const lyricsLine = String(seg.text || "").trim();
-              if (!lyricsLine) continue;
-              allSyncedSegments.push({
-                id: allSyncedSegments.length + 1,
-                start: Number(seg.start) + cumulativeOffset,
-                end: Number(seg.end) + cumulativeOffset,
-                text: lyricsLine,
-              });
-              validChunkTexts.push(lyricsLine);
-            }
-          }
-        } else if (Array.isArray(result.segments)) {
-          for (let sIdx = 0; sIdx < result.segments.length; sIdx++) {
-            const seg = result.segments[sIdx];
-            const cleanText = collapseRepeatedPhrases(String(seg.text || ""));
-            if (!cleanText) continue;
-
-            if (
-              isHallucinatedSegment(
-                {
-                  text: cleanText,
-                  no_speech_prob: seg.no_speech_prob,
-                },
-                sIdx
-              )
-            ) {
-              continue;
-            }
-
-            const currentNorm = normalizeForComparison(cleanText);
-            if (
-              !currentNorm ||
-              (currentNorm === lastAddedSegmentNorm &&
-                currentNorm.split(" ").length > 4)
-            ) {
-              continue;
-            }
-
-            lastAddedSegmentNorm = currentNorm;
+        if (Array.isArray(result.segments)) {
+          for (const seg of result.segments) {
+            const rawLine = String(seg.text ?? "").trim();
+            if (!rawLine) continue;
             allSyncedSegments.push({
               id: allSyncedSegments.length + 1,
               start: Number(seg.start) + cumulativeOffset,
               end: Number(seg.end) + cumulativeOffset,
-              text: cleanText,
+              text: rawLine,
             });
-            validChunkTexts.push(cleanText);
           }
         }
 
         // Bir sonraki parçaya geçmeden önce gerçek ses süresini (response.duration) cumulativeOffset'e ekle
         cumulativeOffset += chunkDuration;
 
-        // Bir önceki parçanın son cümlesini bir sonraki parçanın API isteğine previousContext olarak aktar
-        if (validChunkTexts.length > 0) {
-          const fullChunkText = validChunkTexts.join(" ").trim();
-          const sentences = fullChunkText
-            .split(/(?<=[.!?…])\s+/)
-            .map((s) => s.trim())
-            .filter(Boolean);
-          const lastSentence =
-            sentences.length > 0
-              ? sentences[sentences.length - 1]
-              : validChunkTexts[validChunkTexts.length - 1];
-          previousContext = lastSentence.slice(-220);
-        }
-
         const partialSrt = generateSrtContent(allSyncedSegments);
-        const partialTxt = generatePlainTextContent(allSyncedSegments);
+        const partialTxt =
+          allRawChunkTexts.length > 0
+            ? allRawChunkTexts.join(" ")
+            : generatePlainTextContent(allSyncedSegments);
         setSegments([...allSyncedSegments]);
         setSrtText(partialSrt);
         setPlainText(partialTxt);
@@ -1078,8 +1005,8 @@ export default function VideoToSubtitlePage() {
       title: "Ses Parçaları Yapay Zeka ile Altyazıya Dönüştürülüyor",
       description:
         totalChunks > 0
-          ? `Parça ${currentChunkIndex} / ${totalChunks} tamamlandı... (Groq Whisper Large V3)`
-          : "Groq Whisper Large V3 API ile kesin zaman damgalı ve bağlam korumalı segmentler çıkarılıyor",
+          ? `Parça ${currentChunkIndex} / ${totalChunks} tamamlandı... (DeepInfra Whisper Large V3)`
+          : "DeepInfra Whisper Large V3 API ile saf metin ve zaman damgalı segmentler çıkarılıyor",
       icon: Sparkles,
     },
     {
@@ -1496,7 +1423,7 @@ export default function VideoToSubtitlePage() {
               >
                 <AlertCircle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
                 <div className="text-xs sm:text-sm space-y-1 min-w-0 flex-1">
-                  <p className="font-semibold text-red-300">İşlem Başarısız (Gemini API Yanıtı)</p>
+                  <p className="font-semibold text-red-300">İşlem Başarısız (DeepInfra API Yanıtı)</p>
                   <pre className="text-red-200/90 whitespace-pre-wrap break-words font-mono text-xs bg-zinc-950/70 p-3 rounded-lg border border-red-500/20 overflow-x-auto">
                     {errorMessage}
                   </pre>
@@ -1765,12 +1692,11 @@ export default function VideoToSubtitlePage() {
                       <button
                         type="button"
                         onClick={() => {
-                          const directRefinedTxt =
-                            segments.length > 0
-                              ? generatePlainTextContent(segments)
-                              : plainText;
+                          const directRawTxt =
+                            plainText ||
+                            generatePlainTextContent(segments);
                           downloadFile(
-                            directRefinedTxt,
+                            directRawTxt,
                             `${baseFileName}.txt`,
                             "text/plain"
                           );

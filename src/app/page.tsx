@@ -81,8 +81,23 @@ function normalizeForComparison(text: string): string {
     .trim();
 }
 
+const PROMPT_LEAK_REGEXES: RegExp[] = [
+  /merhaba,?\s*hoş\s*geldiniz\.?/gi,
+  /nasılsınız,?\s*görüşmeler\s*nasıl\s*gidiyor\??/gi,
+  /kendinizden\s+ve\s+yaşadığınız\s+duygulardan\s+biraz\s+bahseder\s+misiniz\??/gi,
+  /noktalama\s+işaretleri(ne)?(\s+ve\s+türkçe\s+imla\s+kurallarına(\s+dikkat\s+et|\s+uygun\s+metin))?\.?/gi,
+  /doğal\s+türkçe\s+konuşma\s+ve\s+seans\s+kaydı\.?/gi,
+  /bu\s+bir\s+türkçe\s+konuşma\s+kaydıdır\.?/gi,
+];
+
 function collapseRepeatedPhrases(text: string): string {
-  const trimmed = text.trim();
+  let trimmed = text.trim();
+  if (!trimmed) return "";
+
+  for (const rx of PROMPT_LEAK_REGEXES) {
+    trimmed = trimmed.replace(rx, " ");
+  }
+  trimmed = trimmed.replace(/\s{2,}/g, " ").trim();
   if (!trimmed) return "";
 
   const sentences = trimmed
@@ -514,7 +529,7 @@ export default function VideoToSubtitlePage() {
 
       const segmentTime = CHUNK_DURATION_SECONDS; // 240 sn (4 dakika)
       setStatusLog(
-        "Ses netleştirme filtresi (highpass + lowpass + dynaudnorm) aktif: 16kHz Mono 64kbps MP3 parçaları (~1.9 MB / 4 dk) üretiliyor..."
+        "Ses netleştirme filtresi (highpass + dynaudnorm) aktif: 16kHz Mono 64kbps MP3 parçaları (~1.9 MB / 4 dk) üretiliyor..."
       );
 
       const exitCode = await activeFfmpeg.exec([
@@ -529,11 +544,10 @@ export default function VideoToSubtitlePage() {
         "-ar",
         "16000", // KESİNLİKLE 16kHz (Kelime yutulmasını önler!)
         // SES NETLEŞTİRME FİLTRESİ:
-        // highpass=f=80 -> Oda uğultusunu ve dip gürültüyü keser
-        // lowpass=f=7500 -> Tiz cızırtıları keser
+        // highpass=f=85 -> Oda uğultusunu ve dip gürültüyü keser
         // dynaudnorm -> Kısık sesle/uzaktan konuşan kişinin sesini otomatik yükseltir ve dengeler!
         "-af",
-        "highpass=f=80,lowpass=f=7500,dynaudnorm=f=150:g=15",
+        "highpass=f=85,dynaudnorm=f=150:g=15",
         "-c:a",
         "libmp3lame",
         "-b:a",

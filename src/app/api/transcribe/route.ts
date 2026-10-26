@@ -27,8 +27,25 @@ export interface VerboseTranscriptionResponse {
 // Round-Robin sayacı (aynı sunucu örneği içinde yükü eşit dağıtmak için)
 let roundRobinCounter = Math.floor(Math.random() * 1000);
 
-const DEFAULT_TURKISH_PROMPT =
-  "Doğal Türkçe konuşma ve seans kaydı. Noktalama işaretlerine ve Türkçe imla kurallarına uygun metin.";
+const basePrompt =
+  "Merhaba, hoş geldiniz. Nasılsınız, görüşmeler nasıl gidiyor? Kendinizden ve yaşadığınız duygulardan biraz bahseder misiniz?";
+
+const PROMPT_LEAK_REGEXES: RegExp[] = [
+  /merhaba,?\s*hoş\s*geldiniz\.?/gi,
+  /nasılsınız,?\s*görüşmeler\s*nasıl\s*gidiyor\??/gi,
+  /kendinizden\s+ve\s+yaşadığınız\s+duygulardan\s+biraz\s+bahseder\s+misiniz\??/gi,
+  /noktalama\s+işaretleri(ne)?(\s+ve\s+türkçe\s+imla\s+kurallarına(\s+dikkat\s+et|\s+uygun\s+metin))?\.?/gi,
+  /doğal\s+türkçe\s+konuşma\s+ve\s+seans\s+kaydı\.?/gi,
+  /bu\s+bir\s+türkçe\s+konuşma\s+kaydıdır\.?/gi,
+];
+
+export function stripPromptLeakage(text: string): string {
+  let cleaned = text;
+  for (const rx of PROMPT_LEAK_REGEXES) {
+    cleaned = cleaned.replace(rx, " ");
+  }
+  return cleaned.replace(/\s{2,}/g, " ").trim();
+}
 
 const HALLUCINATION_PATTERNS: RegExp[] = [
   /altyazı\s*m\.?\s*k\.?/i,
@@ -246,7 +263,7 @@ export async function POST(request: NextRequest) {
             temperature: 0, // KRİTİK: Modelin kelime uydurmasını ve halüsinasyonu engeller!
             prompt:
               previousContext ||
-              DEFAULT_TURKISH_PROMPT, // Bağlam koruma
+              basePrompt, // Doğal konuşma bağlamı
           })) as unknown as VerboseTranscriptionResponse;
 
           const filteredSegments: Array<{
@@ -261,7 +278,8 @@ export async function POST(request: NextRequest) {
           if (Array.isArray(transcription.segments)) {
             for (let idx = 0; idx < transcription.segments.length; idx++) {
               const seg = transcription.segments[idx];
-              const cleanedText = collapseRepeatedPhrases(seg.text ?? "");
+              const withoutPromptLeak = stripPromptLeakage(seg.text ?? "");
+              const cleanedText = collapseRepeatedPhrases(withoutPromptLeak);
               if (!cleanedText) continue;
 
               if (
@@ -290,6 +308,51 @@ export async function POST(request: NextRequest) {
                     ? seg.no_speech_prob
                     : 0,
               });
+            }
+          }
+
+          // Segment metinlerini birleştirip Llama-3.3-70b ile bozuk heceleri onar
+          if (filteredSegments.length > 0) {
+            try {
+              const numberedLines = filteredSegments
+                .map((s, idx) => `[${idx}] ${s.text.trim()}`)
+                .join("\n");
+              const completion = await groq.chat.completions.create({
+                model: "llama-3.3-70b-versatile",
+                temperature: 0.1,
+                messages: [
+                  {
+                    role: "system",
+                    content: `Sen uzman bir Türkçe deşifre ve altyazı redaktörüsün. Sana bir psikolojik danışmanlık seansının ses tanımasından (STT) çıkmış numaralı altyazı satırları verilecek.
+GÖREVİN:
+1. Sesten dolayı yarım kalmış, harfleri kopmuş kelimeleri (Örn: "Peki hayat t a m insanlar m Arkada var m" -> "Peki hayatında tam insanlar mı, arkadaşların var mı?", "Asl anlatay" -> "Aslında anlatayım", "Can biraz yetece i b vicdan k oldu" -> "Canım biraz yanacağı için böyle vicdanım kötü oldu") bağlama uygun şekilde tamir et.
+2. Konuşmanın doğal akışını, samimiyetini ve cümle sayısını ASLA değiştirme, özetleme yapma!
+3. Sadece düzeltilmiş satırları aynı "[0] metin" formatında alt alta döndür, başka hiçbir açıklama yazma.`,
+                  },
+                  { role: "user", content: numberedLines },
+                ],
+              });
+
+              const correctedText =
+                completion.choices[0]?.message?.content || "";
+              const correctedLines = correctedText.split("\n");
+              for (const line of correctedLines) {
+                const match = line.match(/^\[(\d+)\]\s*(.+)$/);
+                if (match) {
+                  const idx = parseInt(match[1], 10);
+                  if (filteredSegments[idx]) {
+                    const repaired = stripPromptLeakage(match[2].trim());
+                    if (repaired) {
+                      filteredSegments[idx].text = repaired;
+                    }
+                  }
+                }
+              }
+            } catch (llmErr) {
+              console.warn(
+                "LLM redaksiyonu atlandı, ham Whisper metni kullanılıyor:",
+                llmErr
+              );
             }
           }
 

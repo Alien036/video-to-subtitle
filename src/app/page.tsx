@@ -51,7 +51,27 @@ import {
 
 type ProcessingStep = 0 | 1 | 2 | 3 | 4;
 
-const CHUNK_DURATION_SECONDS = 300; // 5 dakika = 300 saniye (~1.7 MB / parça, Vercel 4.5 MB sınırının altında)
+const CHUNK_DURATION_SECONDS = 300; // 5 dakika = 300 saniye (~1.1 MB / parça @ 32kbps, Vercel 4.5 MB sınırının altında)
+const MAX_CHUNK_BYTES = 4 * 1024 * 1024; // 4.0 MB (Vercel 4.5 MB sınırının altında güvenli parça limiti)
+const TRANSCRIPTION_CONCURRENCY = 2; // 2'şerli paralel API gönderimi
+
+function getChunkMimeType(filename: string): string {
+  const ext = (filename.split(".").pop() || "").toLowerCase();
+  switch (ext) {
+    case "m4a":
+      return "audio/mp4";
+    case "aac":
+      return "audio/aac";
+    case "ogg":
+      return "audio/ogg";
+    case "wav":
+      return "audio/wav";
+    case "flac":
+      return "audio/flac";
+    default:
+      return "audio/mp3";
+  }
+}
 
 const LANGUAGES = [
   { code: "tr", label: "Türkçe (TR)" },
@@ -329,153 +349,242 @@ export default function VideoToSubtitlePage() {
     videoDurationRef.current = 0;
 
     let ffmpeg: FFmpeg | null = null;
+    let wakeLock: WakeLockSentinel | null = null;
+
+    // 4. Mobil Ekran Uyku Kilidi (WakeLock API) — İşlem süresince ekranın kapanmasını engelle
+    try {
+      if (typeof navigator !== "undefined" && "wakeLock" in navigator) {
+        wakeLock = await navigator.wakeLock?.request("screen");
+      }
+    } catch {
+      // Desteklemeyen tarayıcılarda veya izin verilmeyen durumlarda sessizce devam et
+    }
 
     try {
       // ADIM 1: FFmpeg Motoru Hazırlanıyor
       setCurrentStep(1);
       setStatusLog("WebAssembly FFmpeg çekirdeği tarayıcıda başlatılıyor...");
-      ffmpeg = await loadFFmpegEngine();
+      const activeFfmpeg = await loadFFmpegEngine();
+      ffmpeg = activeFfmpeg;
 
-      // ADIM 2: 5 GB Video Diskten Okunuyor (WORKERFS) ve Ses Ayıklanıyor
+      // ADIM 2: Dosya Diskten Okunuyor (WORKERFS) ve Akıllı Dinamik Parçalama Yapılıyor
       setCurrentStep(2);
       setStatusLog(
         "WORKERFS sanal disk bağlantısı kuruluyor (RAM'e kopyalanmadan doğrudan diskten okunuyor)..."
       );
 
       try {
-        await ffmpeg.unmount("/input");
+        await activeFfmpeg.unmount("/input");
       } catch {
         // Henüz mount edilmemiş olabilir
       }
       try {
-        await ffmpeg.createDir("/input");
+        await activeFfmpeg.createDir("/input");
       } catch {
         // Klasör zaten mevcut olabilir
       }
 
       try {
-        const rootFiles = await ffmpeg.listDir("/");
+        const rootFiles = await activeFfmpeg.listDir("/");
         for (const f of rootFiles) {
-          if (
-            !f.isDir &&
-            (f.name === "full_audio.mp3" || /^chunk_\d+\.mp3$/.test(f.name))
-          ) {
-            await ffmpeg.deleteFile(f.name);
+          if (!f.isDir && /^chunk_\d+\.[a-z0-9]+$/i.test(f.name)) {
+            await activeFfmpeg.deleteFile(f.name);
           }
         }
       } catch {
         // Yoksay
       }
 
-      // KRİTİK KURAL: 5 GB dosyayı belleğe (MEMFS) yazmak yerine WORKERFS ile doğrudan bağla!
-      await ffmpeg.mount(
+      // KRİTİK KURAL: Dosyayı belleğe (MEMFS) yazmak yerine WORKERFS ile doğrudan bağla!
+      await activeFfmpeg.mount(
         "WORKERFS" as any,
         { files: [videoFile] },
         "/input"
       );
 
-      setStatusLog(
-        "Ses akışı Mono 16kHz MP3 olarak daraltılıyor ve 5 dakikalık (~1.7 MB) parçalara bölünüyor..."
-      );
+      const ext = (videoFile.name.split(".").pop() || "").toLowerCase();
+      const isCompressedAudio = ["mp3", "m4a", "aac", "ogg"].includes(ext);
+      const isUncompressedAudio = ["wav", "flac"].includes(ext);
+      const isDirectAudioFile =
+        isCompressedAudio ||
+        isUncompressedAudio ||
+        videoFile.type.startsWith("audio/");
+      const fileSizeMB = videoFile.size / (1024 * 1024);
 
-      const exitCode = await ffmpeg.exec([
-        "-i",
-        `/input/${videoFile.name}`,
-        // 1. Çıktı: Kullanıcının indirebileceği ve dinleyebileceği tam MP3
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-b:a",
-        "64k",
-        "full_audio.mp3",
-        // 2. Çıktı: Vercel 4.5MB sınırına takılmamak için 5'er dakikalık (~1.7MB, 48kbps) parçalar
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-b:a",
-        "48k",
-        "-f",
-        "segment",
-        "-segment_time",
-        String(CHUNK_DURATION_SECONDS),
-        "-reset_timestamps",
-        "1",
-        "chunk_%03d.mp3",
-      ]);
-
-      try {
-        await ffmpeg.unmount("/input");
-      } catch {
-        // Yoksay
+      // 4. Oynatıcı Optimizasyonu: Doğrudan ses dosyası yüklendiyse 2. bir Blob kopyası oluşturma (0 byte ekstra RAM)
+      if (isDirectAudioFile) {
+        if (audioUrl) {
+          URL.revokeObjectURL(audioUrl);
+        }
+        const directAudioUrl = URL.createObjectURL(videoFile);
+        setAudioUrl(directAudioUrl);
+        setAudioBlobSize(videoFile.size);
       }
 
-      if (exitCode !== 0) {
-        throw new Error(
-          `FFmpeg ses ayrıştırma işlemi hata kodu ile sonlandı (Kod: ${exitCode}). Videoda ses kanalı bulunduğundan emin olun.`
+      let segmentTime = CHUNK_DURATION_SECONDS; // Varsayılan: 300 sn
+      let needsFastCompression = !isCompressedAudio || isUncompressedAudio;
+
+      // 1. 150 MB+ Ses Dosyaları İçin Dinamik "Stream Copy (-c copy)" Hesaplaması
+      if (isCompressedAudio && videoFile.size > MAX_CHUNK_BYTES) {
+        segmentTime = fileSizeMB > 80 ? 60 : 180;
+        setStatusLog(
+          `Akıllı Stream Copy (-c copy): ${fileSizeMB.toFixed(1)} MB ses dosyası yeniden encode edilmeden ${segmentTime} saniyelik parçalara ayrılıyor...`
         );
+
+        const copyExitCode = await activeFfmpeg.exec([
+          "-i",
+          "/input/" + videoFile.name,
+          "-f",
+          "segment",
+          "-segment_time",
+          String(segmentTime),
+          "-c",
+          "copy",
+          "chunk_%03d." + ext,
+        ]);
+
+        const afterCopyFiles = await activeFfmpeg.listDir("/");
+        const copyChunkNames = afterCopyFiles
+          .filter(
+            (node) => !node.isDir && /^chunk_\d+\.[a-z0-9]+$/i.test(node.name)
+          )
+          .map((node) => node.name)
+          .sort();
+
+        // 2. Büyük Parça (>4.0 MB Chunk) Kontrolü
+        let hasOversizedChunk =
+          copyExitCode !== 0 || copyChunkNames.length === 0;
+
+        if (!hasOversizedChunk) {
+          for (const cName of copyChunkNames) {
+            const cData = await activeFfmpeg.readFile(cName);
+            const cByteLength = (cData as Uint8Array).byteLength;
+            if (cByteLength > MAX_CHUNK_BYTES) {
+              hasOversizedChunk = true;
+              break;
+            }
+          }
+        }
+
+        if (hasOversizedChunk) {
+          // 4.0 MB'dan büyük parça varsa hepsini sil ve otomatik hızlı sıkıştırma moduna geç
+          for (const cName of copyChunkNames) {
+            try {
+              await activeFfmpeg.deleteFile(cName);
+            } catch {
+              // Yoksay
+            }
+          }
+          needsFastCompression = true;
+        } else {
+          needsFastCompression = false;
+        }
+      } else if (isCompressedAudio && videoFile.size <= MAX_CHUNK_BYTES) {
+        segmentTime = 180;
+        const copyExitCode = await activeFfmpeg.exec([
+          "-i",
+          "/input/" + videoFile.name,
+          "-f",
+          "segment",
+          "-segment_time",
+          String(segmentTime),
+          "-c",
+          "copy",
+          "chunk_%03d." + ext,
+        ]);
+        needsFastCompression = copyExitCode !== 0;
+      }
+
+      // 2. WAV/FLAC, Video veya >4.0 MB Chunk İçin Otomatik Ultra-Hızlı Sıkıştırma Modu
+      if (needsFastCompression) {
+        segmentTime = 300;
+        setStatusLog(
+          "Ultra-hızlı sıkıştırma modu aktif: 12kHz Mono 32kbps MP3 parçaları (~1.1 MB / 5 dk) üretiliyor..."
+        );
+
+        const exitCode = await activeFfmpeg.exec([
+          "-vn", // Görüntüyü tamamen yoksay (Video decode etme)
+          "-sn", // Altyazı kanallarını yoksay
+          "-i",
+          `/input/${videoFile.name}`,
+          "-map",
+          "0:a:0", // Sadece ilk ses kanalını al
+          "-ac",
+          "1", // Mono (Tek kanal)
+          "-ar",
+          "12000", // 16kHz yerine 12kHz (CPU yükünü %35 azaltır, Whisper için fazlasıyla yeterlidir)
+          "-c:a",
+          "libmp3lame",
+          "-b:a",
+          "32k", // 32kbps (5 dakikalık parça sadece ~1.1 MB tutar, mobilde çok hızlı yüklenir)
+          "-q:a",
+          "9", // En hızlı MP3 algoritması (CPU'yu yormaz)
+          "-f",
+          "segment",
+          "-segment_time",
+          "300",
+          "chunk_%03d.mp3",
+        ]);
+
+        if (exitCode !== 0) {
+          throw new Error(
+            `FFmpeg ses ayrıştırma işlemi hata kodu ile sonlandı (Kod: ${exitCode}). Dosyada ses kanalı bulunduğundan emin olun.`
+          );
+        }
+      }
+
+      try {
+        await activeFfmpeg.unmount("/input");
+      } catch {
+        // Yoksay
       }
 
       setExtractionProgress(100);
 
-      const fullAudioData = await ffmpeg.readFile("full_audio.mp3");
-      const fullAudioUint8 = new Uint8Array(fullAudioData as Uint8Array);
-      const fullAudioBlob = new Blob([fullAudioUint8], { type: "audio/mp3" });
-      const generatedAudioUrl = URL.createObjectURL(fullAudioBlob);
-      setAudioUrl(generatedAudioUrl);
-      setAudioBlobSize(fullAudioBlob.size);
-
-      try {
-        await ffmpeg.deleteFile("full_audio.mp3");
-      } catch {
-        // Yoksay
-      }
-
-      const dirFiles = await ffmpeg.listDir("/");
+      const dirFiles = await activeFfmpeg.listDir("/");
       const chunkFileNames = dirFiles
-        .filter((node) => !node.isDir && /^chunk_\d+\.mp3$/.test(node.name))
+        .filter(
+          (node) => !node.isDir && /^chunk_\d+\.[a-z0-9]+$/i.test(node.name)
+        )
         .map((node) => node.name)
         .sort();
 
       if (chunkFileNames.length === 0) {
         throw new Error(
-          "Videodan ses parçaları (chunk_XXX.mp3) üretilemedi. Videoda geçerli bir ses akışı bulunmuyor olabilir."
+          "Dosyadan ses parçaları (chunk_XXX) üretilemedi. Geçerli bir ses akışı bulunmuyor olabilir."
         );
       }
 
-      // ADIM 3: Ses Parçaları Yapay Zeka (Groq Whisper) ile Altyazıya Dönüştürülüyor
+      // ADIM 3: Ses Parçaları Yapay Zeka (Groq Whisper) ile 2'şerli Paralel Altyazıya Dönüştürülüyor
       setCurrentStep(3);
       setTotalChunks(chunkFileNames.length);
 
       const allSyncedSegments: SubtitleSegment[] = [];
       const backoffDelaysSec = [3, 6, 12];
+      let completedChunksCount = 0;
+      const videoAudioBuffers: Uint8Array<ArrayBuffer>[] = [];
 
-      for (
-        let chunkIndex = 0;
-        chunkIndex < chunkFileNames.length;
-        chunkIndex++
-      ) {
+      const transcribeSingleChunk = async (
+        chunkIndex: number
+      ): Promise<Array<{ start: number; end: number; text: string }>> => {
         const chunkName = chunkFileNames[chunkIndex];
-        setCurrentChunkIndex(chunkIndex + 1);
-        setRetryWarning(null);
-        setStatusLog(
-          `Parça ${chunkIndex + 1} / ${chunkFileNames.length} (${chunkName}) Groq Whisper Large V3 Turbo ile işleniyor...`
-        );
 
-        const chunkData = await ffmpeg.readFile(chunkName);
-        const chunkUint8 = new Uint8Array(chunkData as Uint8Array);
-        const chunkFile = new File([chunkUint8], chunkName, {
-          type: "audio/mp3",
-        });
+        // 3. Anlık Bellek Yönetimi: Sadece sırası gelen parçayı MEMFS'ten oku
+        const chunkData = await activeFfmpeg.readFile(chunkName);
+        const rawUint8 = chunkData as Uint8Array;
+        const copyBuffer = new ArrayBuffer(rawUint8.byteLength);
+        const chunkUint8 = new Uint8Array(copyBuffer);
+        chunkUint8.set(rawUint8);
 
-        try {
-          await ffmpeg.deleteFile(chunkName);
-        } catch {
-          // Yoksay
+        // Video dosyası yüklendiyse (küçük 32kbps MP3 parçaları) oynatıcı/indirme için sakla;
+        // Doğrudan ses dosyası yüklendiyse ekstra RAM harcamamak için saklama!
+        if (!isDirectAudioFile) {
+          videoAudioBuffers[chunkIndex] = chunkUint8;
         }
+
+        const chunkFile = new File([chunkUint8], chunkName, {
+          type: getChunkMimeType(chunkName),
+        });
 
         let result: {
           error?: string;
@@ -485,63 +594,73 @@ export default function VideoToSubtitlePage() {
         } | null = null;
 
         const maxAttempts = 3;
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          try {
-            const formData = new FormData();
-            formData.append("file", chunkFile);
-            formData.append("language", language);
-
-            const response = await fetch("/api/transcribe", {
-              method: "POST",
-              body: formData,
-            });
-
-            const responseText = await response.text();
-            let parsedResult: {
-              error?: string;
-              text?: string;
-              duration?: number;
-              segments?: Array<{ start: number; end: number; text: string }>;
-            };
-
+        try {
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-              parsedResult = JSON.parse(responseText);
-            } catch {
-              throw new Error(
-                `Sunucu geçersiz bir yanıt döndürdü (HTTP ${response.status}): ${responseText.slice(0, 200)}`
-              );
-            }
+              const formData = new FormData();
+              formData.append("file", chunkFile);
+              formData.append("language", language);
 
-            if (!response.ok) {
-              throw new Error(
-                parsedResult.error ||
-                  `Parça ${chunkIndex + 1} işlenirken API hatası oluştu (HTTP ${response.status}): ${responseText.slice(0, 200)}`
-              );
-            }
+              const response = await fetch("/api/transcribe", {
+                method: "POST",
+                body: formData,
+              });
 
-            result = parsedResult;
-            setRetryWarning(null);
-            break;
-          } catch (chunkErr: unknown) {
-            if (attempt >= maxAttempts) {
-              throw chunkErr;
-            }
+              const responseText = await response.text();
+              let parsedResult: {
+                error?: string;
+                text?: string;
+                duration?: number;
+                segments?: Array<{ start: number; end: number; text: string }>;
+              };
 
-            const waitSeconds = backoffDelaysSec[attempt - 1] ?? 12;
-            const nextAttempt = attempt + 1;
+              try {
+                parsedResult = JSON.parse(responseText);
+              } catch {
+                throw new Error(
+                  `Sunucu geçersiz bir yanıt döndürdü (HTTP ${response.status}): ${responseText.slice(0, 200)}`
+                );
+              }
 
-            for (let remaining = waitSeconds; remaining > 0; remaining--) {
-              const warningMsg = `API yoğunluğu algılandı, ${remaining} saniye içinde otomatik tekrar deneniyor... (Deneme ${nextAttempt}/${maxAttempts})`;
-              setRetryWarning(warningMsg);
+              if (!response.ok) {
+                throw new Error(
+                  parsedResult.error ||
+                    `Parça ${chunkIndex + 1} işlenirken API hatası oluştu (HTTP ${response.status}): ${responseText.slice(0, 200)}`
+                );
+              }
+
+              result = parsedResult;
+              setRetryWarning(null);
+              break;
+            } catch (chunkErr: unknown) {
+              if (attempt >= maxAttempts) {
+                throw chunkErr;
+              }
+
+              const waitSeconds = backoffDelaysSec[attempt - 1] ?? 12;
+              const nextAttempt = attempt + 1;
+
+              for (let remaining = waitSeconds; remaining > 0; remaining--) {
+                const warningMsg = `API yoğunluğu algılandı, ${remaining} saniye içinde otomatik tekrar deneniyor... (Parça ${chunkIndex + 1}, Deneme ${nextAttempt}/${maxAttempts})`;
+                setRetryWarning(warningMsg);
+                setStatusLog(
+                  `Parça ${chunkIndex + 1} / ${chunkFileNames.length}: ${warningMsg}`
+                );
+                await new Promise((r) => setTimeout(r, 1000));
+              }
+
               setStatusLog(
-                `Parça ${chunkIndex + 1} / ${chunkFileNames.length}: ${warningMsg}`
+                `Parça ${chunkIndex + 1} / ${chunkFileNames.length} yeniden gönderiliyor... (Deneme ${nextAttempt}/${maxAttempts})`
               );
-              await new Promise((r) => setTimeout(r, 1000));
             }
-
-            setStatusLog(
-              `Parça ${chunkIndex + 1} / ${chunkFileNames.length} yeniden gönderiliyor... (Deneme ${nextAttempt}/${maxAttempts})`
-            );
+          }
+        } finally {
+          // 3. Anlık Bellek Temizliği (Streaming Garbage Collection):
+          // /api/transcribe isteği tamamlandığı anda bir sonraki parçaya geçmeden hemen önce RAM'den sil!
+          try {
+            await activeFfmpeg.deleteFile(chunkName);
+          } catch {
+            // Yoksay
           }
         }
 
@@ -551,26 +670,72 @@ export default function VideoToSubtitlePage() {
           );
         }
 
-        const timeOffsetSeconds = chunkIndex * CHUNK_DURATION_SECONDS;
+        completedChunksCount += 1;
+        setCurrentChunkIndex(completedChunksCount);
+
+        // 1. Dinamik Zaman Senkronizasyonu: (chunkIndex * segmentTime)
+        const timeOffsetSeconds = chunkIndex * segmentTime;
+        const chunkSegments: Array<{ start: number; end: number; text: string }> =
+          [];
 
         if (Array.isArray(result.segments) && result.segments.length > 0) {
           for (const seg of result.segments) {
-            allSyncedSegments.push({
-              id: allSyncedSegments.length + 1,
+            chunkSegments.push({
               start: Number(seg.start) + timeOffsetSeconds,
               end: Number(seg.end) + timeOffsetSeconds,
               text: String(seg.text || "").trim(),
             });
           }
         } else if (result.text && String(result.text).trim().length > 0) {
-          allSyncedSegments.push({
-            id: allSyncedSegments.length + 1,
+          chunkSegments.push({
             start: timeOffsetSeconds,
             end:
               timeOffsetSeconds +
-              (Number(result.duration) || CHUNK_DURATION_SECONDS),
+              (Number(result.duration) || segmentTime),
             text: String(result.text).trim(),
           });
+        }
+
+        return chunkSegments;
+      };
+
+      // Paralel Transkripsiyon: 2'şerli gruplar (concurrency = 2) halinde Promise.all ile gönder
+      for (
+        let batchStart = 0;
+        batchStart < chunkFileNames.length;
+        batchStart += TRANSCRIPTION_CONCURRENCY
+      ) {
+        const batchIndices: number[] = [];
+        for (
+          let offset = 0;
+          offset < TRANSCRIPTION_CONCURRENCY &&
+          batchStart + offset < chunkFileNames.length;
+          offset++
+        ) {
+          batchIndices.push(batchStart + offset);
+        }
+
+        const batchLabel = batchIndices
+          .map((idx) => `${idx + 1}`)
+          .join(" ve ");
+        setRetryWarning(null);
+        setStatusLog(
+          `Parça ${batchLabel} / ${chunkFileNames.length} paralel olarak Groq Whisper Large V3 Turbo ile işleniyor...`
+        );
+
+        const batchResults = await Promise.all(
+          batchIndices.map((idx) => transcribeSingleChunk(idx))
+        );
+
+        for (const chunkSegs of batchResults) {
+          for (const seg of chunkSegs) {
+            allSyncedSegments.push({
+              id: allSyncedSegments.length + 1,
+              start: seg.start,
+              end: seg.end,
+              text: seg.text,
+            });
+          }
         }
 
         const partialSrt = generateSrtContent(allSyncedSegments);
@@ -578,6 +743,19 @@ export default function VideoToSubtitlePage() {
         setSegments([...allSyncedSegments]);
         setSrtText(partialSrt);
         setPlainText(partialTxt);
+      }
+
+      // Eğer yüklenen dosya bir video ise, 32kbps MP3 parçalarını CPU harcamadan tek Blob'da birleştir
+      if (!isDirectAudioFile && videoAudioBuffers.length > 0) {
+        if (audioUrl) {
+          URL.revokeObjectURL(audioUrl);
+        }
+        const fullAudioBlob = new Blob(videoAudioBuffers, {
+          type: "audio/mp3",
+        });
+        const generatedAudioUrl = URL.createObjectURL(fullAudioBlob);
+        setAudioUrl(generatedAudioUrl);
+        setAudioBlobSize(fullAudioBlob.size);
       }
 
       // Kullanım kotasını +1 artır
@@ -606,6 +784,15 @@ export default function VideoToSubtitlePage() {
       setErrorMessage(msg);
       setCurrentStep(0);
     } finally {
+      // Mobil Ekran Uyku Kilidini (WakeLock) serbest bırak
+      if (wakeLock) {
+        try {
+          await wakeLock.release();
+        } catch {
+          // Yoksay
+        }
+      }
+
       if (ffmpeg && ffmpeg.loaded) {
         try {
           const remainingFiles = await ffmpeg.listDir("/");
@@ -613,7 +800,7 @@ export default function VideoToSubtitlePage() {
             if (
               !fileNode.isDir &&
               (fileNode.name === "full_audio.mp3" ||
-                /^chunk_\d+\.mp3$/.test(fileNode.name))
+                /^chunk_\d+\.[a-z0-9]+$/i.test(fileNode.name))
             ) {
               try {
                 await ffmpeg.deleteFile(fileNode.name);
@@ -686,7 +873,7 @@ export default function VideoToSubtitlePage() {
       id: 2,
       title: "5 GB Video Diskten Okunuyor ve Ses Ayıklanıyor",
       description:
-        "WORKERFS ile RAM şişmeden 16kHz Mono MP3 ve 5 dk (~1.7 MB) parçalar üretiliyor",
+        "WORKERFS + Tek Geçişli (Single-Pass) 12kHz Mono 32kbps MP3 (~1.1 MB / 5 dk)",
       icon: HardDriveDownload,
     },
     {
@@ -694,8 +881,8 @@ export default function VideoToSubtitlePage() {
       title: "Ses Parçaları Yapay Zeka ile Altyazıya Dönüştürülüyor",
       description:
         totalChunks > 0
-          ? `Parça ${currentChunkIndex} / ${totalChunks} işleniyor... (Groq Whisper Large V3 Turbo)`
-          : "Groq Whisper API ile zaman damgalı segmentler çıkarılıyor",
+          ? `Parça ${currentChunkIndex} / ${totalChunks} tamamlandı... (2x Paralel Groq Whisper)`
+          : "2'şerli paralel Groq Whisper API ile zaman damgalı segmentler çıkarılıyor",
       icon: Sparkles,
     },
     {
@@ -911,7 +1098,7 @@ export default function VideoToSubtitlePage() {
             <input
               ref={fileInputRef}
               type="file"
-              accept="video/*,audio/*,.mkv,.mp4,.mov,.avi,.webm,.flv,.wmv,.m4v"
+              accept="video/*,audio/*,.mkv,.mp4,.mov,.avi,.webm,.flv,.wmv,.m4v,.mp3,.m4a,.aac,.ogg,.wav,.flac"
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0] || null;
@@ -926,14 +1113,14 @@ export default function VideoToSubtitlePage() {
                 </div>
                 <div className="space-y-1">
                   <p className="text-base sm:text-lg font-semibold text-zinc-100">
-                    Video dosyanızı buraya sürükleyip bırakın veya{" "}
+                    Video veya ses dosyanızı buraya sürükleyip bırakın veya{" "}
                     <span className="text-emerald-400 underline underline-offset-4">
                       dosya seçin
                     </span>
                   </p>
                   <p className="text-xs sm:text-sm text-zinc-400">
-                    MP4, MKV, MOV, AVI, WebM desteklenir • 5 GB+ boyutlu uzun
-                    videolar için optimize edildi
+                    MP4, MKV, MOV, MP3, M4A, WAV, FLAC desteklenir • 150 MB - 5 GB+
+                    dosyalar için optimize edildi
                   </p>
                 </div>
               </div>
@@ -1245,7 +1432,7 @@ export default function VideoToSubtitlePage() {
                           </span>
                         </div>
                         <p className="text-xs text-zinc-400 mt-0.5">
-                          16kHz • Mono • 64kbps optimize edilmiş MP3 ses akışı
+                          12kHz • Mono • 32kbps ultra-hızlı (Single-Pass) MP3 ses akışı
                         </p>
                       </div>
                     </div>

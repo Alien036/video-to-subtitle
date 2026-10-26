@@ -51,30 +51,73 @@ import {
 
 type ProcessingStep = 0 | 1 | 2 | 3 | 4;
 
-const CHUNK_DURATION_SECONDS = 300; // 5 dakika = 300 saniye (~1.7 MB / parça @ 48kbps, Vercel 4.5 MB sınırının altında)
-const MAX_CHUNK_BYTES = 4 * 1024 * 1024; // 4.0 MB (Vercel 4.5 MB sınırının altında güvenli parça limiti)
+const CHUNK_DURATION_SECONDS = 240; // 4 dakika = 240 saniye (~1.9 MB / parça @ 64kbps, Vercel 4.5 MB sınırının altında)
 
 const HALLUCINATION_PATTERNS: RegExp[] = [
-  /^altyazı\s*m\.?\s*k\.?$/i,
-  /^altyazi\s*m\.?\s*k\.?$/i,
-  /abone\s+olmayı\s+unutmayın/i,
+  /altyazı\s*m\.?\s*k\.?/i,
+  /altyazi\s*m\.?\s*k\.?/i,
+  /abone\s+olmayı\s+unutma/i,
   /kanala\s+abone\s+ol/i,
+  /\babone\s+olun\b/i,
+  /\babonem\s+yok\b/i,
   /izlediğiniz\s+için\s+teşekkür/i,
   /dinlediğiniz\s+için\s+teşekkür/i,
-  /beğenmeyi\s+ve\s+abone\s+olmayı/i,
-  /videoyu\s+beğenmeyi\s+unutmayın/i,
+  /beğenmeyi\s+ve\s+abone/i,
+  /videoyu\s+beğenmeyi/i,
+  /bir\s+sonraki\s+videoda\s+görüşmek/i,
   /^altyazı\s*:?\s*$/i,
   /^çeviri\s*:?\s*$/i,
   /amara\.org/i,
   /subtitles?\s+by/i,
   /^teşekkürler\.?$/i,
+  /^teşekkür\s+ederim\.?$/i,
+  /^iyi\s+seyirler\.?$/i,
 ];
+
+function normalizeForComparison(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[.,!?;:…"''"()[\]\-_♪♫\s]+/g, " ")
+    .trim();
+}
+
+function collapseRepeatedPhrases(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+
+  const sentences = trimmed
+    .split(/(?<=[.!?…])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const uniqueConsecutiveSentences: string[] = [];
+  let lastNorm = "";
+
+  for (const sentence of sentences) {
+    const norm = normalizeForComparison(sentence);
+    if (!norm) continue;
+    if (norm === lastNorm) {
+      continue;
+    }
+    uniqueConsecutiveSentences.push(sentence);
+    lastNorm = norm;
+  }
+
+  let result = uniqueConsecutiveSentences.join(" ").trim();
+
+  result = result.replace(
+    /\b((?:\S+\s+){2,7}\S+)(?:[,;\s]+\1\b)+/gi,
+    "$1"
+  );
+
+  return result.trim();
+}
 
 function isHallucinatedSegment(seg: {
   text?: string;
   no_speech_prob?: number;
 }): boolean {
-  if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.6) {
+  if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.5) {
     return true;
   }
 
@@ -91,7 +134,7 @@ function isHallucinatedSegment(seg: {
     .replace(/^[.…\s,-]+|[.…\s!-]+$/g, "")
     .trim();
 
-  if (!normalized) {
+  if (!normalized || normalized.length < 2) {
     return true;
   }
 
@@ -458,9 +501,8 @@ export default function VideoToSubtitlePage() {
         isCompressedAudio ||
         isUncompressedAudio ||
         videoFile.type.startsWith("audio/");
-      const fileSizeMB = videoFile.size / (1024 * 1024);
 
-      // 4. Oynatıcı Optimizasyonu: Doğrudan ses dosyası yüklendiyse 2. bir Blob kopyası oluşturma (0 byte ekstra RAM)
+      // Oynatıcı Optimizasyonu: Doğrudan ses dosyası yüklendiyse 2. bir Blob kopyası oluşturma (0 byte ekstra RAM)
       if (isDirectAudioFile) {
         if (audioUrl) {
           URL.revokeObjectURL(audioUrl);
@@ -470,116 +512,43 @@ export default function VideoToSubtitlePage() {
         setAudioBlobSize(videoFile.size);
       }
 
-      let segmentTime = CHUNK_DURATION_SECONDS; // Varsayılan: 300 sn
-      let needsFastCompression = !isCompressedAudio || isUncompressedAudio;
+      const segmentTime = CHUNK_DURATION_SECONDS; // 240 sn (4 dakika)
+      setStatusLog(
+        "Ses netleştirme filtresi (highpass + lowpass + dynaudnorm) aktif: 16kHz Mono 64kbps MP3 parçaları (~1.9 MB / 4 dk) üretiliyor..."
+      );
 
-      // 1. 150 MB+ Ses Dosyaları İçin Dinamik "Stream Copy (-c copy)" Hesaplaması
-      if (isCompressedAudio && videoFile.size > MAX_CHUNK_BYTES) {
-        segmentTime = fileSizeMB > 80 ? 60 : 180;
-        setStatusLog(
-          `Akıllı Stream Copy (-c copy): ${fileSizeMB.toFixed(1)} MB ses dosyası yeniden encode edilmeden ${segmentTime} saniyelik parçalara ayrılıyor...`
+      const exitCode = await activeFfmpeg.exec([
+        "-vn",
+        "-sn",
+        "-i",
+        `/input/${videoFile.name}`,
+        "-map",
+        "0:a:0",
+        "-ac",
+        "1",
+        "-ar",
+        "16000", // KESİNLİKLE 16kHz (Kelime yutulmasını önler!)
+        // SES NETLEŞTİRME FİLTRESİ:
+        // highpass=f=80 -> Oda uğultusunu ve dip gürültüyü keser
+        // lowpass=f=7500 -> Tiz cızırtıları keser
+        // dynaudnorm -> Kısık sesle/uzaktan konuşan kişinin sesini otomatik yükseltir ve dengeler!
+        "-af",
+        "highpass=f=80,lowpass=f=7500,dynaudnorm=f=150:g=15",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "64k", // 64kbps kristal netlik (240 saniyede sadece ~1.9 MB tutar!)
+        "-f",
+        "segment",
+        "-segment_time",
+        "240", // 4 dakikalık parçalar (~1.9 MB/parça)
+        "chunk_%03d.mp3",
+      ]);
+
+      if (exitCode !== 0) {
+        throw new Error(
+          `FFmpeg ses ayrıştırma işlemi hata kodu ile sonlandı (Kod: ${exitCode}). Dosyada ses kanalı bulunduğundan emin olun.`
         );
-
-        const copyExitCode = await activeFfmpeg.exec([
-          "-i",
-          "/input/" + videoFile.name,
-          "-f",
-          "segment",
-          "-segment_time",
-          String(segmentTime),
-          "-c",
-          "copy",
-          "chunk_%03d." + ext,
-        ]);
-
-        const afterCopyFiles = await activeFfmpeg.listDir("/");
-        const copyChunkNames = afterCopyFiles
-          .filter(
-            (node) => !node.isDir && /^chunk_\d+\.[a-z0-9]+$/i.test(node.name)
-          )
-          .map((node) => node.name)
-          .sort();
-
-        // 2. Büyük Parça (>4.0 MB Chunk) Kontrolü
-        let hasOversizedChunk =
-          copyExitCode !== 0 || copyChunkNames.length === 0;
-
-        if (!hasOversizedChunk) {
-          for (const cName of copyChunkNames) {
-            const cData = await activeFfmpeg.readFile(cName);
-            const cByteLength = (cData as Uint8Array).byteLength;
-            if (cByteLength > MAX_CHUNK_BYTES) {
-              hasOversizedChunk = true;
-              break;
-            }
-          }
-        }
-
-        if (hasOversizedChunk) {
-          // 4.0 MB'dan büyük parça varsa hepsini sil ve otomatik hızlı sıkıştırma moduna geç
-          for (const cName of copyChunkNames) {
-            try {
-              await activeFfmpeg.deleteFile(cName);
-            } catch {
-              // Yoksay
-            }
-          }
-          needsFastCompression = true;
-        } else {
-          needsFastCompression = false;
-        }
-      } else if (isCompressedAudio && videoFile.size <= MAX_CHUNK_BYTES) {
-        segmentTime = 180;
-        const copyExitCode = await activeFfmpeg.exec([
-          "-i",
-          "/input/" + videoFile.name,
-          "-f",
-          "segment",
-          "-segment_time",
-          String(segmentTime),
-          "-c",
-          "copy",
-          "chunk_%03d." + ext,
-        ]);
-        needsFastCompression = copyExitCode !== 0;
-      }
-
-      // 2. WAV/FLAC, Video veya >4.0 MB Chunk İçin Whisper Doğal Frekansında (16kHz 48kbps) Sıkıştırma Modu
-      if (needsFastCompression) {
-        segmentTime = 300;
-        setStatusLog(
-          "Yüksek netlikli sıkıştırma modu aktif: 16kHz Mono 48kbps MP3 parçaları (~1.7 MB / 5 dk) üretiliyor..."
-        );
-
-        const exitCode = await activeFfmpeg.exec([
-          "-vn", // Görüntüyü tamamen yoksay (Video decode etme)
-          "-sn", // Altyazı kanallarını yoksay
-          "-i",
-          `/input/${videoFile.name}`,
-          "-map",
-          "0:a:0", // Sadece ilk ses kanalını al
-          "-ac",
-          "1", // Mono (Tek kanal)
-          "-ar",
-          "16000", // Whisper'ın doğal (native) 16kHz örnekleme frekansı (s, ş, ç, t harflerinde yüksek netlik)
-          "-c:a",
-          "libmp3lame",
-          "-b:a",
-          "48k", // 48kbps (300 saniyelik parça ~1.7 MB tutar, kristal netliğinde ses)
-          "-q:a",
-          "5", // Yüksek kalite / hız dengesi
-          "-f",
-          "segment",
-          "-segment_time",
-          "300",
-          "chunk_%03d.mp3",
-        ]);
-
-        if (exitCode !== 0) {
-          throw new Error(
-            `FFmpeg ses ayrıştırma işlemi hata kodu ile sonlandı (Kod: ${exitCode}). Dosyada ses kanalı bulunduğundan emin olun.`
-          );
-        }
       }
 
       try {
@@ -613,9 +582,10 @@ export default function VideoToSubtitlePage() {
       let completedChunksCount = 0;
       const videoAudioBuffers: Uint8Array<ArrayBuffer>[] = [];
 
-      // 4. Kesin Zaman Damgası (Exact Duration Offset) ve Bağlam Aktarımı (previousContext)
+      // 4. Kesin Zaman Damgası (Exact Duration Offset), Tekrar Önleme ve Bağlam Aktarımı (previousContext)
       let cumulativeOffset = 0;
       let previousContext = "";
+      let lastAddedSegmentNorm = "";
 
       for (let chunkIndex = 0; chunkIndex < chunkFileNames.length; chunkIndex++) {
         const chunkName = chunkFileNames[chunkIndex];
@@ -751,10 +721,24 @@ export default function VideoToSubtitlePage() {
 
         if (Array.isArray(result.segments) && result.segments.length > 0) {
           for (const seg of result.segments) {
-            if (isHallucinatedSegment(seg)) {
+            const cleanText = collapseRepeatedPhrases(String(seg.text || ""));
+            if (!cleanText) continue;
+
+            if (
+              isHallucinatedSegment({
+                text: cleanText,
+                no_speech_prob: seg.no_speech_prob,
+              })
+            ) {
               continue;
             }
-            const cleanText = String(seg.text || "").trim();
+
+            const currentNorm = normalizeForComparison(cleanText);
+            if (!currentNorm || currentNorm === lastAddedSegmentNorm) {
+              continue;
+            }
+
+            lastAddedSegmentNorm = currentNorm;
             allSyncedSegments.push({
               id: allSyncedSegments.length + 1,
               start: Number(seg.start) + cumulativeOffset,
@@ -763,18 +747,24 @@ export default function VideoToSubtitlePage() {
             });
             validChunkTexts.push(cleanText);
           }
-        } else if (
-          result.text &&
-          !isHallucinatedSegment({ text: result.text })
-        ) {
-          const cleanText = String(result.text).trim();
-          allSyncedSegments.push({
-            id: allSyncedSegments.length + 1,
-            start: cumulativeOffset,
-            end: cumulativeOffset + chunkDuration,
-            text: cleanText,
-          });
-          validChunkTexts.push(cleanText);
+        } else if (result.text) {
+          const cleanText = collapseRepeatedPhrases(String(result.text));
+          const currentNorm = normalizeForComparison(cleanText);
+          if (
+            cleanText &&
+            currentNorm &&
+            currentNorm !== lastAddedSegmentNorm &&
+            !isHallucinatedSegment({ text: cleanText })
+          ) {
+            lastAddedSegmentNorm = currentNorm;
+            allSyncedSegments.push({
+              id: allSyncedSegments.length + 1,
+              start: cumulativeOffset,
+              end: cumulativeOffset + chunkDuration,
+              text: cleanText,
+            });
+            validChunkTexts.push(cleanText);
+          }
         }
 
         // Bir sonraki parçaya geçmeden önce gerçek ses süresini (response.duration) cumulativeOffset'e ekle
@@ -929,7 +919,7 @@ export default function VideoToSubtitlePage() {
       id: 2,
       title: "5 GB Video Diskten Okunuyor ve Ses Ayıklanıyor",
       description:
-        "WORKERFS + Tek Geçişli (Single-Pass) 16kHz Mono 48kbps MP3 (~1.7 MB / 5 dk)",
+        "WORKERFS + Ses Netleştirme (dynaudnorm) + 16kHz Mono 64kbps MP3 (~1.9 MB / 4 dk)",
       icon: HardDriveDownload,
     },
     {
@@ -1488,7 +1478,7 @@ export default function VideoToSubtitlePage() {
                           </span>
                         </div>
                         <p className="text-xs text-zinc-400 mt-0.5">
-                          16kHz • Mono • 48kbps yüksek netlikli (Single-Pass) MP3 ses akışı
+                          16kHz • Mono • 64kbps ses netleştirmeli (dynaudnorm) MP3 ses akışı
                         </p>
                       </div>
                     </div>

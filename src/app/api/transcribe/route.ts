@@ -28,29 +28,97 @@ export interface VerboseTranscriptionResponse {
 let roundRobinCounter = Math.floor(Math.random() * 1000);
 
 const DEFAULT_TURKISH_PROMPT =
-  "Bu bir Türkçe konuşma kaydıdır. Noktalama işaretlerine ve Türkçe imla kurallarına dikkat et.";
+  "Doğal Türkçe konuşma ve seans kaydı. Noktalama işaretlerine ve Türkçe imla kurallarına uygun metin.";
 
 const HALLUCINATION_PATTERNS: RegExp[] = [
-  /^altyazı\s*m\.?\s*k\.?$/i,
-  /^altyazi\s*m\.?\s*k\.?$/i,
-  /abone\s+olmayı\s+unutmayın/i,
+  /altyazı\s*m\.?\s*k\.?/i,
+  /altyazi\s*m\.?\s*k\.?/i,
+  /abone\s+olmayı\s+unutma/i,
   /kanala\s+abone\s+ol/i,
+  /\babone\s+olun\b/i,
+  /\babonem\s+yok\b/i,
   /izlediğiniz\s+için\s+teşekkür/i,
   /dinlediğiniz\s+için\s+teşekkür/i,
-  /beğenmeyi\s+ve\s+abone\s+olmayı/i,
-  /videoyu\s+beğenmeyi\s+unutmayın/i,
+  /beğenmeyi\s+ve\s+abone/i,
+  /videoyu\s+beğenmeyi/i,
+  /bir\s+sonraki\s+videoda\s+görüşmek/i,
   /^altyazı\s*:?\s*$/i,
   /^çeviri\s*:?\s*$/i,
   /amara\.org/i,
   /subtitles?\s+by/i,
   /^teşekkürler\.?$/i,
+  /^teşekkür\s+ederim\.?$/i,
+  /^iyi\s+seyirler\.?$/i,
 ];
+
+export function normalizeForComparison(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[.,!?;:…"''"()[\]\-_♪♫\s]+/g, " ")
+    .trim();
+}
+
+/**
+ * Segment içindeki ardışık tekrar eden cümleleri ve kelime öbeklerini tekilleştirir
+ * (Örn: "Dediğin gibi, deli bir şey var." x6 -> tek cümle)
+ */
+export function collapseRepeatedPhrases(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+
+  // 1. Cümle bazında ardışık tekrarları temizle
+  const sentences = trimmed
+    .split(/(?<=[.!?…])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const uniqueConsecutiveSentences: string[] = [];
+  let lastNorm = "";
+
+  for (const sentence of sentences) {
+    const norm = normalizeForComparison(sentence);
+    if (!norm) continue;
+    if (norm === lastNorm) {
+      continue;
+    }
+    uniqueConsecutiveSentences.push(sentence);
+    lastNorm = norm;
+  }
+
+  let result = uniqueConsecutiveSentences.join(" ").trim();
+
+  // 2. Virgül veya boşlukla ayrılmış ardışık aynı ifadeleri (3+ kelimelik) tekilleştir
+  result = result.replace(
+    /\b((?:\S+\s+){2,7}\S+)(?:[,;\s]+\1\b)+/gi,
+    "$1"
+  );
+
+  return result.trim();
+}
 
 export function isHallucinatedSegment(seg: {
   text?: string;
   no_speech_prob?: number;
+  avg_logprob?: number;
+  compression_ratio?: number;
 }): boolean {
-  if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.6) {
+  // 1. Sessizlik olasılığı yüksekse filtrele
+  if (typeof seg.no_speech_prob === "number" && seg.no_speech_prob > 0.5) {
+    return true;
+  }
+
+  // 2. Sessizlik ihtimali orta düzeyde olup modelin kelime güveni (avg_logprob) çok düşükse filtrele
+  if (
+    typeof seg.no_speech_prob === "number" &&
+    seg.no_speech_prob > 0.35 &&
+    typeof seg.avg_logprob === "number" &&
+    seg.avg_logprob < -0.9
+  ) {
+    return true;
+  }
+
+  // 3. Model tamamen düşük güvenle uyduruyorsa filtrele
+  if (typeof seg.avg_logprob === "number" && seg.avg_logprob < -1.35) {
     return true;
   }
 
@@ -68,7 +136,7 @@ export function isHallucinatedSegment(seg: {
     .replace(/^[.…\s,-]+|[.…\s!-]+$/g, "")
     .trim();
 
-  if (!normalized) {
+  if (!normalized || normalized.length < 2) {
     return true;
   }
 
@@ -181,20 +249,49 @@ export async function POST(request: NextRequest) {
               DEFAULT_TURKISH_PROMPT, // Bağlam koruma
           })) as unknown as VerboseTranscriptionResponse;
 
-          const filteredSegments = Array.isArray(transcription.segments)
-            ? transcription.segments
-                .filter((seg) => !isHallucinatedSegment(seg))
-                .map((seg, idx) => ({
-                  id: seg.id ?? idx,
-                  start: Number(seg.start) || 0,
-                  end: Number(seg.end) || 0,
-                  text: (seg.text ?? "").trim(),
-                  no_speech_prob:
-                    typeof seg.no_speech_prob === "number"
-                      ? seg.no_speech_prob
-                      : 0,
-                }))
-            : [];
+          const filteredSegments: Array<{
+            id: number;
+            start: number;
+            end: number;
+            text: string;
+            no_speech_prob: number;
+          }> = [];
+          let lastSegmentNorm = "";
+
+          if (Array.isArray(transcription.segments)) {
+            for (let idx = 0; idx < transcription.segments.length; idx++) {
+              const seg = transcription.segments[idx];
+              const cleanedText = collapseRepeatedPhrases(seg.text ?? "");
+              if (!cleanedText) continue;
+
+              if (
+                isHallucinatedSegment({
+                  ...seg,
+                  text: cleanedText,
+                })
+              ) {
+                continue;
+              }
+
+              // Ardışık kısır döngü (tekrar) filtresi: Bir önceki segmentle birebir aynıysa atla
+              const currentNorm = normalizeForComparison(cleanedText);
+              if (!currentNorm || currentNorm === lastSegmentNorm) {
+                continue;
+              }
+
+              lastSegmentNorm = currentNorm;
+              filteredSegments.push({
+                id: seg.id ?? idx,
+                start: Number(seg.start) || 0,
+                end: Number(seg.end) || 0,
+                text: cleanedText,
+                no_speech_prob:
+                  typeof seg.no_speech_prob === "number"
+                    ? seg.no_speech_prob
+                    : 0,
+              });
+            }
+          }
 
           return NextResponse.json({
             text: filteredSegments.map((s) => s.text).join(" ").trim(),

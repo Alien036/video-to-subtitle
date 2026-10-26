@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect } from "react";
+import Image from "next/image";
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
@@ -550,9 +551,16 @@ export default function AuthView({
             className="relative z-10 w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-900/80 p-6 sm:p-8 backdrop-blur-xl shadow-2xl space-y-6"
           >
             {/* Logo & Başlık */}
-            <div className="text-center space-y-2">
-              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-500/20 to-indigo-500/20 border border-emerald-500/30 shadow-inner">
-                <Subtitles className="h-6 w-6 text-emerald-400" />
+            <div className="text-center space-y-3">
+              <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-zinc-950/80 border border-emerald-500/30 p-2 shadow-lg shadow-emerald-500/10">
+                <Image
+                  src="/voxsub-icon.png"
+                  alt="VoxSub Studio"
+                  width={52}
+                  height={52}
+                  className="w-full h-full object-contain filter drop-shadow-[0_0_10px_rgba(52,211,153,0.35)]"
+                  priority
+                />
               </div>
               <div className="flex items-center justify-center gap-2">
                 <h1 className="text-2xl font-bold tracking-tight text-white">

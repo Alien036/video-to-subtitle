@@ -14,9 +14,12 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "VoxSub AI — 5GB+ Büyük Video Ses & Altyazı Stüdyosu",
+  title: "VoxSub Studio — 5GB+ Büyük Video Ses & Altyazı Stüdyosu",
   description:
     "Devasa boyutlu videoları sunucuya yüklemeden tarayıcı içinde WORKERFS ile sese dönüştüren ve Groq Whisper Large V3 ile tam senkronize SRT altyazı üreten web uygulaması.",
+  icons: {
+    icon: "/favicon.ico",
+  },
 };
 
 export default function RootLayout({

@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useRef, useEffect, useCallback } from "react";
+import Image from "next/image";
 import { onAuthStateChanged, signOut, User as FirebaseUser } from "firebase/auth";
 import { doc, onSnapshot } from "firebase/firestore";
 import { FFmpeg } from "@ffmpeg/ffmpeg";
@@ -1030,8 +1031,15 @@ export default function VideoToSubtitlePage() {
       <header className="relative z-10 border-b border-zinc-800/80 bg-zinc-950/80 backdrop-blur-xl">
         <div className="mx-auto flex flex-wrap max-w-6xl items-center justify-between gap-4 px-6 py-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500/20 to-indigo-500/20 border border-emerald-500/30 shadow-inner">
-              <Subtitles className="h-5 w-5 text-emerald-400" />
+            <div className="relative flex h-11 w-11 items-center justify-center rounded-xl bg-zinc-900/90 border border-emerald-500/30 p-1 shadow-inner overflow-hidden group">
+              <Image
+                src="/voxsub-icon.png"
+                alt="VoxSub Studio"
+                width={36}
+                height={36}
+                className="w-full h-full object-contain filter drop-shadow-[0_0_8px_rgba(52,211,153,0.35)] transition-transform duration-300 group-hover:scale-110"
+                priority
+              />
             </div>
             <div>
               <div className="flex items-center gap-2">
